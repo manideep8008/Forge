@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "forge-gateway"
+    static_configs:
+      - targets: ["forge-gateway:8080"]
+    metrics_path: /metrics
+
+  - job_name: "forge-orchestrator"
+    static_configs:
+      - targets: ["forge-orchestrator:8090"]
+    metrics_path: /metrics
+
+  - job_name: "forge-git-svc"
+    static_configs:
+      - targets: ["forge-git-svc:8081"]
+    metrics_path: /metrics
+
+  - job_name: "forge-docker-svc"
+    static_configs:
+      - targets: ["forge-docker-svc:8082"]
+    metrics_path: /metrics

@@ -1,0 +1,198 @@
+services:
+  # === Data Layer ===
+  forge-redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  forge-postgres:
+    image: postgres:16-alpine
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-forge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forge_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-forge}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forge}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  forge-chroma:
+    image: chromadb/chroma:latest
+    ports:
+      - "${CHROMA_PORT:-8000}:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+
+  # forge-ollama removed — using cloud Ollama via OLLAMA_BASE_URL in .env
+
+  # === Python Orchestrator ===
+  forge-orchestrator:
+    build:
+      context: ./forge-orchestrator
+      dockerfile: Dockerfile
+    ports:
+      - "${ORCHESTRATOR_PORT:-8090}:8090"
+    environment:
+      REDIS_URL: redis://forge-redis:6379
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      CHROMA_HOST: forge-chroma
+      CHROMA_PORT: 8000
+      GIT_SVC_URL: http://forge-git-svc:8081
+      DOCKER_SVC_URL: http://forge-docker-svc:8082
+      MODEL_REQUIREMENTS: ${MODEL_REQUIREMENTS:-llama3:8b}
+      MODEL_ARCHITECT: ${MODEL_ARCHITECT:-llama3:8b}
+      MODEL_CODEGEN: ${MODEL_CODEGEN:-codellama:13b}
+      MODEL_REVIEW: ${MODEL_REVIEW:-phi3:mini}
+      MODEL_TEST: ${MODEL_TEST:-codellama:13b}
+      MODEL_CICD: ${MODEL_CICD:-llama3:8b}
+      MODEL_MONITOR: ${MODEL_MONITOR:-phi3:mini}
+      MODEL_INTENT: ${MODEL_INTENT:-llama3:8b}
+      MODEL_EMBEDDING: ${MODEL_EMBEDDING:-all-minilm:l6-v2}
+    depends_on:
+      forge-redis:
+        condition: service_healthy
+      forge-postgres:
+        condition: service_healthy
+      forge-chroma:
+        condition: service_started
+    volumes:
+      - workspace:/workspace
+
+  # === Go Services ===
+  forge-gateway:
+    build:
+      context: ./forge-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    environment:
+      REDIS_URL: redis://forge-redis:6379
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      ORCHESTRATOR_URL: http://forge-orchestrator:8090
+      GIT_SVC_URL: http://forge-git-svc:8081
+      DOCKER_SVC_URL: http://forge-docker-svc:8082
+      JWT_SECRET: ${JWT_SECRET:-forge-dev-secret-change-in-production}
+      RATE_LIMIT_PIPELINE: ${RATE_LIMIT_PIPELINE:-10}
+      RATE_LIMIT_QUERY: ${RATE_LIMIT_QUERY:-100}
+      DEV_MODE: "true"
+    depends_on:
+      forge-redis:
+        condition: service_healthy
+      forge-postgres:
+        condition: service_healthy
+
+  # One-shot init: creates a git repo in the shared workspace volume
+  workspace-init:
+    image: alpine/git
+    entrypoint: /bin/sh
+    command: >
+      -c "
+        git config --global --add safe.directory /workspace &&
+        if [ ! -d /workspace/.git ]; then
+          git init /workspace &&
+          git -C /workspace config user.email 'forge@local' &&
+          git -C /workspace config user.name 'Forge' &&
+          git -C /workspace commit --allow-empty -m 'chore: init workspace';
+        fi
+      "
+    volumes:
+      - workspace:/workspace
+
+  forge-git-svc:
+    build:
+      context: ./forge-git-svc
+      dockerfile: Dockerfile
+    ports:
+      - "${GIT_SVC_PORT:-8081}:8081"
+    environment:
+      REDIS_URL: redis://forge-redis:6379
+      # Go main.go reads REDIS_ADDR as host:port (not a full URL)
+      REDIS_ADDR: forge-redis:6379
+    depends_on:
+      forge-redis:
+        condition: service_healthy
+      workspace-init:
+        condition: service_completed_successfully
+    volumes:
+      - workspace:/workspace
+
+  forge-docker-svc:
+    build:
+      context: ./forge-docker-svc
+      dockerfile: Dockerfile
+    ports:
+      - "${DOCKER_SVC_PORT:-8082}:8082"
+    environment:
+      REDIS_URL: redis://forge-redis:6379
+    depends_on:
+      forge-redis:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - workspace:/workspace
+
+  # === Frontend ===
+  forge-ui:
+    build:
+      context: ./forge-web
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      VITE_API_URL: http://forge-gateway:8080
+      VITE_WS_URL: ws://forge-gateway:8080
+    depends_on:
+      - forge-gateway
+    volumes:
+      - ./forge-web:/app
+      - /app/node_modules
+
+  # === Observability ===
+  forge-prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prom-data:/prometheus
+    depends_on:
+      - forge-gateway
+      - forge-orchestrator
+
+  forge-grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning
+    depends_on:
+      - forge-prometheus
+
+volumes:
+  redis-data:
+  pg-data:
+  chroma-data:
+  workspace:
+  prom-data:
+  grafana-data:

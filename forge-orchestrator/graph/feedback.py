@@ -1,0 +1,85 @@
+"""Feedback controller — manages review/test retry loops."""
+
+import structlog
+
+from graph.state import PipelineState
+
+logger = structlog.get_logger()
+
+
+def should_retry_review(state: PipelineState) -> str:
+    """Decide whether to loop back to codegen after review.
+
+    Returns: "codegen" to retry, "test" to proceed, "halt" to stop.
+    """
+    if state.review_passed:
+        logger.info("review_passed", pipeline_id=state.pipeline_id)
+        return "test"
+
+    if state.review_iteration >= state.max_iterations:
+        logger.warning(
+            "review_max_iterations",
+            pipeline_id=state.pipeline_id,
+            iterations=state.review_iteration,
+        )
+        return "halt"
+
+    # Check if there are HIGH/CRITICAL issues
+    has_critical = any(
+        issue.get("severity") in ("high", "critical")
+        for issue in state.review_issues
+    )
+
+    if has_critical:
+        logger.info(
+            "review_retry",
+            pipeline_id=state.pipeline_id,
+            iteration=state.review_iteration + 1,
+            critical_issues=sum(
+                1 for i in state.review_issues
+                if i.get("severity") in ("high", "critical")
+            ),
+        )
+        return "codegen"
+
+    # Low/medium issues — proceed anyway
+    return "test"
+
+
+def should_retry_test(state: PipelineState) -> str:
+    """Decide whether to loop back to codegen after testing.
+
+    Returns: "codegen" to retry, "hitl" to proceed, "halt" to stop.
+    """
+    if state.tests_passed:
+        logger.info("tests_passed", pipeline_id=state.pipeline_id)
+        return "hitl"
+
+    if state.test_iteration >= state.max_iterations:
+        logger.warning(
+            "test_max_iterations",
+            pipeline_id=state.pipeline_id,
+            iterations=state.test_iteration,
+        )
+        return "halt"
+
+    logger.info(
+        "test_retry",
+        pipeline_id=state.pipeline_id,
+        iteration=state.test_iteration + 1,
+        failed_tests=sum(
+            1 for t in state.test_results if t.get("status") == "failed"
+        ),
+    )
+    return "codegen"
+
+
+def should_rollback(state: PipelineState) -> str:
+    """Decide whether to rollback after monitoring.
+
+    Returns: "rollback" or "complete".
+    """
+    if state.should_rollback:
+        logger.warning("monitor_rollback", pipeline_id=state.pipeline_id)
+        return "rollback"
+    return "complete"
