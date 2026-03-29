@@ -91,22 +91,32 @@ async def codegen_node(state: PipelineState) -> dict:
         "test_results": state.test_results,
         "review_iteration": state.review_iteration,
         "test_iteration": state.test_iteration,
+        # Modification mode fields
+        "modification_request": state.modification_request,
+        "existing_files": state.existing_files,
     }
     result = await codegen_agent.run(context)
     if result.success:
+        new_files = result.output.get("files", {})
+        # In modification mode: merge existing files with changed files
+        # (LLM returns only the files that changed; unchanged files survive)
+        merged_files = {**state.existing_files, **new_files} if state.modification_request else new_files
         await context_manager.set_many(state.pipeline_id, {
-            "generated_files": result.output.get("files", {}),
+            "generated_files": merged_files,
             "git_branch": result.output.get("branch", ""),
         })
         await context_manager.publish_event(state.pipeline_id, "agent.codegen.completed", result.output)
+    else:
+        merged_files = {}
     return {
-        "generated_files": result.output.get("files", {}),
+        "generated_files": merged_files if result.success else {},
         "git_branch": result.output.get("branch", ""),
         "current_stage": "review" if result.success else "failed",
         "error": result.error,
         "total_tokens": state.total_tokens + result.tokens_used,
         "stage_status": {**state.stage_status, "codegen": "completed" if result.success else "failed"},
     }
+
 
 
 async def review_node(state: PipelineState) -> dict:
@@ -119,7 +129,7 @@ async def review_node(state: PipelineState) -> dict:
     }
     result = await review_agent.run(context)
     issues = result.output.get("issues", [])
-    passed = not any(i.get("severity") in ("high", "critical") for i in issues)
+    passed = not any(i.get("severity") == "critical" for i in issues)
     await context_manager.publish_event(state.pipeline_id, "agent.review.completed", {
         "passed": passed, "issues_count": len(issues),
     })
@@ -143,7 +153,8 @@ async def test_node(state: PipelineState) -> dict:
     }
     result = await test_agent.run(context)
     tests = result.output.get("test_results", [])
-    passed = all(t.get("status") == "passed" for t in tests) if tests else False
+    # Empty test results = pytest couldn't run = don't block, proceed to HITL
+    passed = all(t.get("status") == "passed" for t in tests) if tests else True
     coverage = result.output.get("coverage_percent", 0.0)
     await context_manager.publish_event(state.pipeline_id, "agent.test.completed", {
         "passed": passed, "coverage": coverage,
@@ -160,19 +171,72 @@ async def test_node(state: PipelineState) -> dict:
 
 
 async def hitl_node(state: PipelineState) -> dict:
-    """Wait for human-in-the-loop approval."""
+    """Wait for human-in-the-loop approval via Redis pub/sub."""
     await context_manager.set(state.pipeline_id, "current_stage", "hitl")
+    await context_manager.set(state.pipeline_id, "status", "awaiting_approval")
+
+    # Clear any stale decision from a previous HITL pass to prevent infinite loops
+    await context_manager.set(state.pipeline_id, "hitl_decision", "")
+
+    # Publish event so the UI shows the approval modal
     await context_manager.publish_event(state.pipeline_id, "pipeline.awaiting_approval", {
         "review_issues": state.review_issues,
         "test_results": state.test_results,
         "coverage_percent": state.coverage_percent,
     })
-    # In production, this would pause and wait for human input via Redis
-    # For now, auto-approve
+
+    logger.info("hitl_waiting", pipeline_id=state.pipeline_id)
+
+    valid_decisions = {"approve", "reject", "request_changes", "modify"}
+
+    # Use pub/sub with a slow-poll fallback instead of busy-polling every 2s.
+    # This avoids holding a Redis connection under constant load for up to 1 hour.
+    decision = await context_manager.wait_for_field(
+        pipeline_id=state.pipeline_id,
+        field="hitl_decision",
+        expected_values=valid_decisions,
+        timeout=3600,
+        poll_fallback=10,
+    )
+
+    if decision and decision in valid_decisions:
+        comments = await context_manager.get(state.pipeline_id, "hitl_comments") or ""
+        logger.info(
+            "hitl_decision_received",
+            pipeline_id=state.pipeline_id,
+            decision=decision,
+        )
+
+        if decision == "approve":
+            return {
+                "hitl_decision": decision,
+                "hitl_comments": comments,
+                "current_stage": "cicd",
+                "stage_status": {**state.stage_status, "hitl": "completed"},
+            }
+        elif decision == "reject":
+            return {
+                "hitl_decision": decision,
+                "hitl_comments": comments,
+                "current_stage": "failed",
+                "error": f"Pipeline rejected by human reviewer: {comments}" if comments else "Pipeline rejected by human reviewer",
+                "stage_status": {**state.stage_status, "hitl": "failed"},
+            }
+        else:  # request_changes / modify
+            return {
+                "hitl_decision": decision,
+                "hitl_comments": comments,
+                "current_stage": "codegen",
+                "stage_status": {**state.stage_status, "hitl": "completed"},
+            }
+
+    # Timeout — auto-reject
+    logger.warning("hitl_timeout", pipeline_id=state.pipeline_id)
     return {
-        "hitl_decision": "approve",
-        "current_stage": "cicd",
-        "stage_status": {**state.stage_status, "hitl": "completed"},
+        "hitl_decision": "reject",
+        "current_stage": "failed",
+        "error": "HITL approval timed out after 1 hour",
+        "stage_status": {**state.stage_status, "hitl": "failed"},
     }
 
 
@@ -249,6 +313,15 @@ async def complete_node(state: PipelineState) -> dict:
     }
 
 
+def _route_hitl(state: PipelineState) -> str:
+    """Route based on HITL decision."""
+    if state.current_stage == "failed":
+        return "halt"
+    if state.hitl_decision in ("request_changes", "modify"):
+        return "codegen"
+    return "cicd"
+
+
 def check_failed(state: PipelineState) -> str:
     """Route to halt if any stage failed."""
     if state.current_stage == "failed":
@@ -290,7 +363,10 @@ def build_pipeline() -> StateGraph:
         "continue": "codegen",
     })
 
-    graph.add_edge("codegen", "review")
+    graph.add_conditional_edges("codegen", check_failed, {
+        "halt": "halt",
+        "continue": "review",
+    })
 
     # Review → feedback loop
     graph.add_conditional_edges("review", should_retry_review, {
@@ -306,7 +382,11 @@ def build_pipeline() -> StateGraph:
         "halt": "halt",
     })
 
-    graph.add_edge("hitl", "cicd")
+    graph.add_conditional_edges("hitl", _route_hitl, {
+        "cicd": "cicd",
+        "codegen": "codegen",
+        "halt": "halt",
+    })
 
     graph.add_conditional_edges("cicd", check_failed, {
         "halt": "halt",

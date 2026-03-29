@@ -1,10 +1,12 @@
 """Monitor Agent — health checks, log analysis, rollback decisions."""
 
+import asyncio
 import json
 import os
 
 import httpx
 from agents.base import BaseAgent
+from agents.codegen import _extract_json
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
@@ -43,7 +45,7 @@ class MonitorAgent(BaseAgent):
         return "monitor"
 
     def get_model(self) -> str:
-        return os.getenv("MODEL_MONITOR", "phi3:mini")
+        return os.getenv("MODEL_MONITOR", "qwen3.5:397b-cloud")
 
     async def validate(self, context: dict) -> bool:
         return bool(context.get("pipeline_id"))
@@ -53,8 +55,17 @@ class MonitorAgent(BaseAgent):
         deploy_url = context.get("deploy_url", "")
         docker_image = context.get("docker_image", "")
 
-        # Collect health data
-        health_data = await self._check_health(deploy_url, pipeline_id)
+        # Wait for the container to stabilise before checking health
+        await asyncio.sleep(8)
+
+        # Collect health data — retry up to 3 times
+        health_data = None
+        for attempt in range(3):
+            health_data = await self._check_health(deploy_url, pipeline_id)
+            if health_data.get("healthy"):
+                break
+            await asyncio.sleep(5)
+        health_data = health_data or {"healthy": True, "note": "No data"}
 
         prompt = f"""Analyze this deployment health data and determine if rollback is needed:
 
@@ -76,14 +87,8 @@ Respond with valid JSON only."""
         )
 
         response_text = result["response"].strip()
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-
-        try:
-            output = json.loads(response_text)
-        except json.JSONDecodeError:
+        output = _extract_json(response_text)
+        if output is None:
             output = {
                 "health_status": health_data,
                 "should_rollback": False,
@@ -111,19 +116,31 @@ Respond with valid JSON only."""
 
         docker_svc_url = os.getenv("DOCKER_SVC_URL", "http://forge-docker-svc:8082")
 
+        container_name = f"forge-{pipeline_id}"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(f"{docker_svc_url}/docker/health/{pipeline_id}")
+                resp = await client.get(f"{docker_svc_url}/docker/health/{container_name}")
                 if resp.status_code == 200:
-                    return resp.json()
-        except Exception:
-            pass
+                    data = resp.json()
+                    # Also try hitting the app directly to confirm it responds
+                    if deploy_url:
+                        verify_url = deploy_url.replace("localhost", "host.docker.internal")
+                        try:
+                            app_resp = await client.get(verify_url, follow_redirects=True, timeout=5)
+                            data["app_reachable"] = app_resp.status_code < 500
+                            if app_resp.status_code < 500:
+                                data["healthy"] = True
+                        except Exception:
+                            data["app_reachable"] = False
+                    return data
+        except Exception as exc:
+            logger.warning("health_check_failed", pipeline_id=pipeline_id, error=str(exc))
 
         return {
-            "healthy": True,
+            "healthy": False,
             "error_rate": 0.0,
             "response_time_ms": 0,
             "checks_passed": 0,
             "checks_total": 0,
-            "note": "Health check service unavailable — assuming healthy",
+            "note": "Health check service unavailable — marking unhealthy (safe-fail)",
         }

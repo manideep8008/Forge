@@ -9,8 +9,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -90,6 +92,7 @@ type DeployResponse struct {
 type RollbackRequest struct {
 	PipelineID    string `json:"pipeline_id"`
 	PreviousImage string `json:"previous_image"`
+	Port          string `json:"port"`
 }
 
 type RollbackResponse struct {
@@ -127,10 +130,16 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
 
-	redisAddr := os.Getenv("REDIS_URL")
+	// Prefer REDIS_ADDR (host:port) over REDIS_URL (redis://host:port).
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = os.Getenv("REDIS_URL")
+	}
 	if redisAddr == "" {
 		redisAddr = "localhost:6379"
 	}
+	// Strip redis:// prefix if present so go-redis gets a plain host:port.
+	redisAddr = strings.TrimPrefix(redisAddr, "redis://")
 
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 
@@ -233,8 +242,28 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	// Drain the build output so the build completes.
-	io.Copy(io.Discard, resp.Body)
+
+	// Read build output and check for errors in the stream.
+	var lastErr string
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var msg struct {
+			Stream string `json:"stream"`
+			Error  string `json:"error"`
+		}
+		if err := decoder.Decode(&msg); err != nil {
+			break
+		}
+		if msg.Error != "" {
+			lastErr = msg.Error
+		}
+	}
+
+	if lastErr != "" {
+		s.log.Error().Str("build_id", buildID).Str("error", lastErr).Msg("Docker build failed")
+		s.writeError(w, http.StatusInternalServerError, "docker build failed: "+lastErr)
+		return
+	}
 
 	dockerBuildsTotal.Inc()
 
@@ -280,12 +309,15 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		ExposedPorts: nat.PortSet{
 			containerPort: struct{}{},
 		},
+		Env: []string{
+			fmt.Sprintf("PORT=%s", req.Port),
+		},
 		Labels: map[string]string{
 			"forge.pipeline_id": req.PipelineID,
 			"forge.managed":     "true",
 		},
 		Healthcheck: &container.HealthConfig{
-			Test:     []string{"CMD-SHELL", fmt.Sprintf("wget -qO- http://localhost:%s/health || exit 1", req.Port)},
+			Test:     []string{"CMD-SHELL", fmt.Sprintf("wget -qO- http://localhost:%s/health || wget -qO- http://localhost:%s/ || exit 1", req.Port, req.Port)},
 			Interval: 10 * time.Second,
 			Timeout:  5 * time.Second,
 			Retries:  3,
@@ -356,8 +388,11 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	// Stop current container.
 	s.stopAndRemoveContainer(ctx, containerName)
 
-	// Find a free port or reuse the original port. For simplicity we use 8080.
-	port := "8080"
+	// Use the port from the request, or fall back to a hash-based port
+	port := req.Port
+	if port == "" {
+		port = "8080"
+	}
 	containerPort := nat.Port(port + "/tcp")
 
 	containerCfg := &container.Config{
@@ -365,13 +400,16 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		ExposedPorts: nat.PortSet{
 			containerPort: struct{}{},
 		},
+		Env: []string{
+			fmt.Sprintf("PORT=%s", port),
+		},
 		Labels: map[string]string{
 			"forge.pipeline_id": req.PipelineID,
 			"forge.managed":     "true",
 			"forge.rollback":    "true",
 		},
 		Healthcheck: &container.HealthConfig{
-			Test:     []string{"CMD-SHELL", fmt.Sprintf("wget -qO- http://localhost:%s/health || exit 1", port)},
+			Test:     []string{"CMD-SHELL", fmt.Sprintf("wget -qO- http://localhost:%s/health || wget -qO- http://localhost:%s/ || exit 1", port, port)},
 			Interval: 10 * time.Second,
 			Timeout:  5 * time.Second,
 			Retries:  3,
@@ -471,6 +509,55 @@ func (s *Server) handleContainerHealth(w http.ResponseWriter, r *http.Request) {
 
 	s.log.Info().Str("container_id", containerID).Bool("healthy", healthy).Msg("health check")
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// GET /docker/list — lists all forge-managed containers.
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	containers, err := s.docker.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to list containers: "+err.Error())
+		return
+	}
+
+	type containerInfo struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		PipelineID string `json:"pipeline_id"`
+		HostPort   string `json:"host_port"`
+		State      string `json:"state"`
+		Image      string `json:"image"`
+		Created    int64  `json:"created"`
+	}
+
+	result := make([]containerInfo, 0)
+	for _, c := range containers {
+		if c.Labels["forge.managed"] != "true" {
+			continue
+		}
+		hostPort := ""
+		for _, p := range c.Ports {
+			if p.PublicPort > 0 {
+				hostPort = fmt.Sprintf("%d", p.PublicPort)
+				break
+			}
+		}
+		name := ""
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		result = append(result, containerInfo{
+			ID:         c.ID[:12],
+			Name:       name,
+			PipelineID: c.Labels["forge.pipeline_id"],
+			HostPort:   hostPort,
+			State:      c.State,
+			Image:      c.Image,
+			Created:    c.Created,
+		})
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"containers": result})
 }
 
 // DELETE /docker/cleanup/{id}
@@ -599,6 +686,55 @@ func createTar(dir string) (*bytes.Buffer, error) {
 }
 
 // ---------------------------------------------------------------------------
+// TTL-based cleanup — removes forge-managed containers older than 1 hour.
+// ---------------------------------------------------------------------------
+
+func (s *Server) ttlCleanupLoop() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.cleanupOldContainers()
+	}
+}
+
+func (s *Server) cleanupOldContainers() {
+	ctx := context.Background()
+	containers, err := s.docker.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		s.log.Warn().Err(err).Msg("ttl-cleanup: failed to list containers")
+		return
+	}
+
+	ttl := time.Hour
+	now := time.Now()
+	removed := 0
+
+	for _, c := range containers {
+		if c.Labels["forge.managed"] != "true" {
+			continue
+		}
+		created := time.Unix(c.Created, 0)
+		if now.Sub(created) < ttl {
+			continue
+		}
+		name := ""
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		s.log.Info().Str("container", name).Str("pipeline", c.Labels["forge.pipeline_id"]).Msg("ttl-cleanup: removing old container")
+		timeout := 10
+		s.docker.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &timeout})
+		if err := s.docker.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err == nil {
+			removed++
+		}
+	}
+
+	if removed > 0 {
+		s.log.Info().Int("removed", removed).Msg("ttl-cleanup: completed")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -628,14 +764,39 @@ func main() {
 		r.Post("/build", srv.handleBuild)
 		r.Post("/deploy", srv.handleDeploy)
 		r.Post("/rollback", srv.handleRollback)
+		r.Get("/list", srv.handleList)
 		r.Get("/health/{id}", srv.handleContainerHealth)
 		r.Delete("/cleanup/{id}", srv.handleCleanup)
 	})
 
+	// Start background TTL cleanup for old forge-managed containers (1-hour TTL).
+	go srv.ttlCleanupLoop()
+
 	addr := ":8082"
 	srv.log.Info().Str("addr", addr).Msg("forge-docker-svc starting")
 
-	if err := http.ListenAndServe(addr, r); err != nil {
-		srv.log.Fatal().Err(err).Msg("server exited")
+	httpSrv := &http.Server{
+		Addr:         addr,
+		Handler:      r,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
 	}
+
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			srv.log.Fatal().Err(err).Msg("server exited")
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	srv.log.Info().Msg("shutting down")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		srv.log.Fatal().Err(err).Msg("server forced to shutdown")
+	}
+	srv.log.Info().Msg("server stopped")
 }

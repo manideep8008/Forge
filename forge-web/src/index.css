@@ -12,9 +12,10 @@
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
   }
 
+  /* Modern thin scrollbar */
   ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+    width: 5px;
+    height: 5px;
   }
 
   ::-webkit-scrollbar-track {
@@ -22,36 +23,111 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply bg-slate-600 rounded-full;
+    @apply bg-indigo-500/20 rounded-full;
+    transition: background 0.2s;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    @apply bg-slate-500;
+    @apply bg-indigo-500/40;
+  }
+
+  /* Selection styling */
+  ::selection {
+    @apply bg-indigo-500/30 text-white;
   }
 }
 
 @layer components {
+  /* Glass card */
   .card {
-    @apply bg-forge-surface border border-forge-border rounded-lg;
+    @apply bg-forge-surface backdrop-blur-xl border border-forge-border rounded-xl shadow-glass;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
 
+  .card:hover {
+    @apply border-forge-border-bright;
+  }
+
+  /* Gradient accent card */
+  .card-accent {
+    @apply card;
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(139, 92, 246, 0.03) 100%);
+  }
+
+  /* Primary button with gradient */
   .btn-primary {
-    @apply bg-forge-accent hover:bg-forge-accent-hover text-white font-medium
-      px-4 py-2 rounded-lg transition-colors duration-150;
+    @apply text-white font-medium px-4 py-2.5 rounded-xl transition-all duration-200;
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+    box-shadow: 0 2px 10px rgba(99, 102, 241, 0.25);
+  }
+
+  .btn-primary:hover {
+    box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+    transform: translateY(-1px);
+  }
+
+  .btn-primary:active {
+    transform: translateY(0);
   }
 
   .btn-danger {
-    @apply bg-red-600 hover:bg-red-700 text-white font-medium
-      px-4 py-2 rounded-lg transition-colors duration-150;
+    @apply text-white font-medium px-4 py-2.5 rounded-xl transition-all duration-200;
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    box-shadow: 0 2px 10px rgba(239, 68, 68, 0.2);
+  }
+
+  .btn-danger:hover {
+    box-shadow: 0 4px 20px rgba(239, 68, 68, 0.35);
+    transform: translateY(-1px);
   }
 
   .btn-warning {
-    @apply bg-yellow-600 hover:bg-yellow-700 text-white font-medium
-      px-4 py-2 rounded-lg transition-colors duration-150;
+    @apply text-white font-medium px-4 py-2.5 rounded-xl transition-all duration-200;
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    box-shadow: 0 2px 10px rgba(245, 158, 11, 0.2);
+  }
+
+  .btn-warning:hover {
+    box-shadow: 0 4px 20px rgba(245, 158, 11, 0.35);
+    transform: translateY(-1px);
   }
 
   .btn-success {
-    @apply bg-emerald-600 hover:bg-emerald-700 text-white font-medium
-      px-4 py-2 rounded-lg transition-colors duration-150;
+    @apply text-white font-medium px-4 py-2.5 rounded-xl transition-all duration-200;
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    box-shadow: 0 2px 10px rgba(16, 185, 129, 0.2);
+  }
+
+  .btn-success:hover {
+    box-shadow: 0 4px 20px rgba(16, 185, 129, 0.35);
+    transform: translateY(-1px);
+  }
+
+  /* Ghost button */
+  .btn-ghost {
+    @apply px-4 py-2.5 rounded-xl text-forge-muted font-medium transition-all duration-200;
+    @apply hover:bg-white/5 hover:text-forge-text;
+  }
+
+  /* Modern input */
+  .input-modern {
+    @apply w-full bg-forge-bg/80 border border-forge-border rounded-xl px-3 py-2.5
+      text-sm text-forge-text placeholder-forge-muted/60
+      focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/50
+      transition-all duration-200;
+  }
+
+  /* Badge pill */
+  .badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium;
+  }
+
+  /* Ambient background mesh */
+  .bg-mesh {
+    background-image:
+      radial-gradient(at 27% 37%, rgba(99, 102, 241, 0.08) 0px, transparent 50%),
+      radial-gradient(at 97% 21%, rgba(139, 92, 246, 0.06) 0px, transparent 50%),
+      radial-gradient(at 52% 99%, rgba(99, 102, 241, 0.04) 0px, transparent 50%),
+      radial-gradient(at 10% 29%, rgba(139, 92, 246, 0.03) 0px, transparent 50%);
   }
 }

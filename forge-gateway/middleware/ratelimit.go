@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -31,6 +32,9 @@ func RateLimiter(rdb *redis.Client) func(http.Handler) http.Handler {
 			}
 
 			ip := r.RemoteAddr
+			if host, _, err := net.SplitHostPort(ip); err == nil {
+				ip = host
+			}
 			key := fmt.Sprintf("rl:%s:%s", bucket, ip)
 
 			ctx := r.Context()

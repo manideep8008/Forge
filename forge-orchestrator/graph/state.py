@@ -22,6 +22,10 @@ class PipelineState(BaseModel):
     # Input
     input_text: str = ""
     intent_type: str = ""
+    # Iteration: user message + existing files from a previous completed pipeline
+    modification_request: str = ""
+    existing_files: dict[str, str] = Field(default_factory=dict)
+
 
     # Stage tracking
     current_stage: str = "pending"
@@ -50,7 +54,7 @@ class PipelineState(BaseModel):
     # Feedback loop tracking
     review_iteration: int = 0
     test_iteration: int = 0
-    max_iterations: int = 3
+    max_iterations: int = 2
 
     # HITL gate
     hitl_decision: str = ""

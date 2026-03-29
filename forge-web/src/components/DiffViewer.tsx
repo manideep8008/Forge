@@ -11,30 +11,30 @@ interface DiffViewerProps {
 const diffStyles = {
   variables: {
     dark: {
-      diffViewerBackground: '#0f172a',
+      diffViewerBackground: '#0a0e1a',
       diffViewerColor: '#e2e8f0',
-      addedBackground: '#064e3b20',
+      addedBackground: '#064e3b15',
       addedColor: '#6ee7b7',
-      removedBackground: '#7f1d1d20',
+      removedBackground: '#7f1d1d15',
       removedColor: '#fca5a5',
-      wordAddedBackground: '#065f4630',
-      wordRemovedBackground: '#991b1b30',
-      addedGutterBackground: '#064e3b30',
-      removedGutterBackground: '#7f1d1d30',
-      gutterBackground: '#1e293b',
-      gutterBackgroundDark: '#1e293b',
+      wordAddedBackground: '#065f4625',
+      wordRemovedBackground: '#991b1b25',
+      addedGutterBackground: '#064e3b20',
+      removedGutterBackground: '#7f1d1d20',
+      gutterBackground: '#0d1226',
+      gutterBackgroundDark: '#0d1226',
       highlightBackground: '#1e3a5f',
       highlightGutterBackground: '#1e3a5f',
-      codeFoldGutterBackground: '#1e293b',
-      codeFoldBackground: '#1e293b',
-      emptyLineBackground: '#0f172a',
+      codeFoldGutterBackground: '#0d1226',
+      codeFoldBackground: '#0d1226',
+      emptyLineBackground: '#0a0e1a',
       gutterColor: '#475569',
       addedGutterColor: '#6ee7b7',
       removedGutterColor: '#fca5a5',
-      codeFoldContentColor: '#94a3b8',
-      diffViewerTitleBackground: '#1e293b',
+      codeFoldContentColor: '#7c85a6',
+      diffViewerTitleBackground: '#0d1226',
       diffViewerTitleColor: '#e2e8f0',
-      diffViewerTitleBorderColor: '#334155',
+      diffViewerTitleBorderColor: 'rgba(56, 68, 100, 0.4)',
     },
   },
   line: {
@@ -58,18 +58,20 @@ export default function DiffViewer({ filename, oldCode, newCode }: DiffViewerPro
   const [expanded, setExpanded] = useState(true);
 
   return (
-    <div className="border border-forge-border rounded-lg overflow-hidden">
+    <div className="border border-forge-border rounded-xl overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-2 bg-slate-800/50 hover:bg-slate-800
+        className="w-full flex items-center gap-2 px-3.5 py-2.5 bg-forge-bg-alt hover:bg-white/[0.02]
           text-xs font-mono transition-colors"
       >
-        {expanded ? (
-          <ChevronDown className="w-3.5 h-3.5 text-forge-muted" />
-        ) : (
-          <ChevronRight className="w-3.5 h-3.5 text-forge-muted" />
-        )}
-        <FileCode2 className="w-3.5 h-3.5 text-forge-accent" />
+        <span className="text-forge-muted/60">
+          {expanded ? (
+            <ChevronDown className="w-3.5 h-3.5" />
+          ) : (
+            <ChevronRight className="w-3.5 h-3.5" />
+          )}
+        </span>
+        <FileCode2 className="w-3.5 h-3.5 text-indigo-400" />
         <span className="text-forge-text">{filename}</span>
       </button>
 

@@ -4,6 +4,7 @@ import json
 import os
 
 from agents.base import BaseAgent
+from agents.codegen import _extract_json
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
@@ -54,27 +55,21 @@ Respond with valid JSON only."""
         )
 
         response_text = result["response"].strip()
-        # Try to extract JSON from response
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-
-        try:
-            spec = json.loads(response_text)
-        except json.JSONDecodeError:
+        spec = _extract_json(response_text)
+        if spec is None:
             # Fallback: create basic spec from raw response
             spec = {
                 "title": input_text[:100],
-                "description": response_text,
+                "description": response_text[:500],
                 "acceptance_criteria": [],
                 "edge_cases": [],
                 "dependencies": [],
                 "estimated_complexity": "medium",
             }
 
+        success = bool(spec.get("acceptance_criteria") or spec.get("description"))
         return AgentResult(
-            success=True,
+            success=success,
             output=spec,
             tokens_used=result["tokens_used"],
             model_used=result["model"],

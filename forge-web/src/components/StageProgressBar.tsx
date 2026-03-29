@@ -15,18 +15,32 @@ function formatDuration(ms: number): string {
 function StageIcon({ status }: { status: string }) {
   switch (status) {
     case 'completed':
-      return <CheckCircle2 className="w-6 h-6 text-emerald-400" />;
+      return (
+        <div className="p-1 bg-emerald-500/10 rounded-full">
+          <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+        </div>
+      );
     case 'running':
       return (
-        <div className="relative">
-          <Loader2 className="w-6 h-6 text-blue-400 animate-spin" />
-          <div className="absolute inset-0 rounded-full animate-pulse-blue bg-blue-400/20" />
+        <div className="relative p-1">
+          <div className="absolute inset-0 rounded-full bg-indigo-400/20 animate-ping" />
+          <div className="relative p-1 bg-indigo-500/10 rounded-full">
+            <Loader2 className="w-5 h-5 text-indigo-400 animate-spin" />
+          </div>
         </div>
       );
     case 'failed':
-      return <XCircle className="w-6 h-6 text-red-400" />;
+      return (
+        <div className="p-1 bg-red-500/10 rounded-full">
+          <XCircle className="w-5 h-5 text-red-400" />
+        </div>
+      );
     default:
-      return <Circle className="w-6 h-6 text-slate-600" />;
+      return (
+        <div className="p-1">
+          <Circle className="w-5 h-5 text-forge-muted/30" />
+        </div>
+      );
   }
 }
 
@@ -36,20 +50,20 @@ function getStageData(stages: PipelineStage[], name: StageName): PipelineStage {
 
 function connectorColor(leftStatus: string, rightStatus: string): string {
   if (leftStatus === 'completed' && rightStatus !== 'pending') {
-    return 'bg-emerald-400';
+    return 'bg-gradient-to-r from-emerald-400 to-indigo-400';
   }
   if (leftStatus === 'completed') {
-    return 'bg-slate-600';
+    return 'bg-emerald-400/40';
   }
   if (leftStatus === 'failed') {
-    return 'bg-red-400/50';
+    return 'bg-red-400/30';
   }
-  return 'bg-slate-700';
+  return 'bg-forge-border';
 }
 
 export default function StageProgressBar({ stages }: StageProgressBarProps) {
   return (
-    <div className="card p-6">
+    <div className="card-accent p-6">
       <div className="flex items-center justify-between">
         {STAGE_ORDER.map((name, idx) => {
           const stage = getStageData(stages, name);
@@ -64,20 +78,20 @@ export default function StageProgressBar({ stages }: StageProgressBarProps) {
               <div className="flex flex-col items-center min-w-[80px]">
                 <StageIcon status={stage.status} />
                 <span
-                  className={`text-xs font-medium mt-2 ${
+                  className={`text-xs font-medium mt-2 transition-colors ${
                     stage.status === 'running'
-                      ? 'text-blue-400'
+                      ? 'text-indigo-400'
                       : stage.status === 'completed'
                         ? 'text-emerald-400'
                         : stage.status === 'failed'
                           ? 'text-red-400'
-                          : 'text-slate-500'
+                          : 'text-forge-muted/50'
                   }`}
                 >
                   {STAGE_LABELS[name]}
                 </span>
                 {stage.duration_ms != null && (
-                  <span className="text-[10px] text-slate-500 mt-0.5">
+                  <span className="text-[10px] text-forge-muted/40 mt-0.5">
                     {formatDuration(stage.duration_ms)}
                   </span>
                 )}
@@ -86,7 +100,7 @@ export default function StageProgressBar({ stages }: StageProgressBarProps) {
               {/* Connector line */}
               {nextStage && (
                 <div
-                  className={`flex-1 h-0.5 mx-1 rounded-full transition-colors duration-500 ${connectorColor(stage.status, nextStage.status)}`}
+                  className={`flex-1 h-[2px] mx-2 rounded-full transition-all duration-700 ${connectorColor(stage.status, nextStage.status)}`}
                 />
               )}
             </div>

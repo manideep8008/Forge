@@ -8,12 +8,14 @@ import {
   Loader2,
   Clock,
   XCircle,
+  Trash2,
 } from 'lucide-react';
 import type { Pipeline, StageStatus } from '../types';
 
 interface ProjectSidebarProps {
   onNewPipeline: () => void;
   refreshKey: number;
+  onRefresh: () => void;
 }
 
 function StatusIcon({ status }: { status: StageStatus }) {
@@ -21,18 +23,19 @@ function StatusIcon({ status }: { status: StageStatus }) {
     case 'completed':
       return <CheckCircle2 className="w-4 h-4 text-emerald-400" />;
     case 'running':
-      return <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />;
+      return <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />;
     case 'failed':
       return <XCircle className="w-4 h-4 text-red-400" />;
     default:
-      return <Clock className="w-4 h-4 text-slate-500" />;
+      return <Clock className="w-4 h-4 text-forge-muted/50" />;
   }
 }
 
-export default function ProjectSidebar({ onNewPipeline, refreshKey }: ProjectSidebarProps) {
+export default function ProjectSidebar({ onNewPipeline, refreshKey, onRefresh }: ProjectSidebarProps) {
   const [pipelines, setPipelines] = useState<Pipeline[]>([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const navigate = useNavigate();
   const { id: activeId } = useParams<{ id: string }>();
 
@@ -54,6 +57,27 @@ export default function ProjectSidebar({ onNewPipeline, refreshKey }: ProjectSid
     fetchPipelines();
   }, [refreshKey]);
 
+  const handleDelete = async (e: React.MouseEvent, pipelineId: string) => {
+    e.stopPropagation();
+    if (!confirm('Delete this pipeline? This cannot be undone.')) return;
+
+    setDeletingId(pipelineId);
+    try {
+      const res = await fetch(`/api/pipeline/${pipelineId}`, { method: 'DELETE' });
+      if (res.ok) {
+        setPipelines((prev) => prev.filter((p) => p.id !== pipelineId));
+        if (activeId === pipelineId) {
+          navigate('/');
+        }
+        onRefresh();
+      }
+    } catch {
+      console.error('Failed to delete pipeline');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   const filtered = pipelines.filter((p) => {
     const term = search.toLowerCase();
     const idMatch = p.id?.toLowerCase().includes(term);
@@ -63,16 +87,20 @@ export default function ProjectSidebar({ onNewPipeline, refreshKey }: ProjectSid
   });
 
   return (
-    <aside className="w-72 bg-forge-surface border-r border-forge-border flex flex-col h-full">
+    <aside className="w-72 bg-forge-surface-solid/90 backdrop-blur-xl border-r border-forge-border flex flex-col h-full">
       {/* Header */}
       <div className="p-4 border-b border-forge-border">
-        <div className="flex items-center gap-2 mb-4">
-          <Hammer className="w-6 h-6 text-forge-accent" />
-          <h1 className="text-lg font-bold">Forge</h1>
+        <div className="flex items-center gap-2.5 mb-4">
+          <div className="p-1.5 bg-gradient-to-br from-indigo-500/20 to-purple-500/20 rounded-lg">
+            <Hammer className="w-5 h-5 text-indigo-400" />
+          </div>
+          <h1 className="text-lg font-bold bg-gradient-to-r from-white to-indigo-200 bg-clip-text text-transparent">
+            Forge
+          </h1>
         </div>
         <button
           onClick={onNewPipeline}
-          className="btn-primary w-full flex items-center justify-center gap-2"
+          className="btn-primary w-full flex items-center justify-center gap-2 text-sm"
         >
           <Plus className="w-4 h-4" />
           New Pipeline
@@ -82,15 +110,13 @@ export default function ProjectSidebar({ onNewPipeline, refreshKey }: ProjectSid
       {/* Search */}
       <div className="p-3 border-b border-forge-border">
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-forge-muted" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-forge-muted/60" />
           <input
             type="text"
             placeholder="Search pipelines..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full bg-forge-bg border border-forge-border rounded-lg pl-9 pr-3 py-2
-              text-sm text-forge-text placeholder-forge-muted
-              focus:outline-none focus:ring-1 focus:ring-forge-accent focus:border-forge-accent"
+            className="input-modern pl-9"
           />
         </div>
       </div>
@@ -112,21 +138,39 @@ export default function ProjectSidebar({ onNewPipeline, refreshKey }: ProjectSid
                 <button
                   onClick={() => navigate(`/pipeline/${pipeline.id}`)}
                   className={`w-full text-left px-4 py-3 flex items-start gap-3
-                    hover:bg-slate-700/50 transition-colors
-                    ${activeId === pipeline.id ? 'bg-slate-700/70 border-l-2 border-forge-accent' : ''}`}
+                    transition-all duration-150 group
+                    ${activeId === pipeline.id
+                      ? 'bg-indigo-500/10 border-l-2 border-indigo-400'
+                      : 'hover:bg-white/[0.03] border-l-2 border-transparent'
+                    }`}
                 >
-                  <StatusIcon status={pipeline.status} />
+                  <div className="mt-0.5">
+                    <StatusIcon status={pipeline.status} />
+                  </div>
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium truncate">
+                    <p className={`text-sm font-medium truncate ${
+                      activeId === pipeline.id ? 'text-indigo-200' : 'text-forge-text group-hover:text-white'
+                    }`}>
                        {pipeline.intent_type ? `[${pipeline.intent_type}] ` : ''}
                        {pipeline.id?.slice(0, 8) || 'Unknown ID'}
                     </p>
                     <p className="text-xs text-forge-muted truncate mt-0.5" title={pipeline.input_text}>
                       {pipeline.input_text || pipeline.description || 'No description'}
                     </p>
-                    <p className="text-xs text-slate-500 mt-1">
+                    <p className="text-[11px] text-forge-muted/50 mt-1">
                       {new Date(pipeline.created_at).toLocaleDateString()}
                     </p>
+                  </div>
+                  {/* Delete button */}
+                  <div
+                    className="mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                    onClick={(e) => handleDelete(e, pipeline.id)}
+                  >
+                    {deletingId === pipeline.id ? (
+                      <Loader2 className="w-3.5 h-3.5 text-forge-muted animate-spin" />
+                    ) : (
+                      <Trash2 className="w-3.5 h-3.5 text-forge-muted hover:text-red-400 transition-colors cursor-pointer" />
+                    )}
                   </div>
                 </button>
               </li>

@@ -69,6 +69,10 @@ func main() {
 		api.Get("/api/pipeline/{id}/status", handlers.GetPipelineStatus)
 		api.Get("/api/pipeline/{id}/diff", handlers.GetPipelineDiff)
 		api.Post("/api/pipeline/{id}/approve", handlers.ApprovePipeline)
+		api.Delete("/api/pipeline/{id}", handlers.DeletePipeline)
+		api.Post("/api/pipeline/{id}/cancel", handlers.CancelPipeline)
+		api.Post("/api/pipeline/{id}/retry", handlers.RetryPipeline)
+		api.Post("/api/pipeline/{id}/modify", handlers.ModifyPipeline)
 		api.Get("/api/pipelines", handlers.ListPipelines)
 	})
 

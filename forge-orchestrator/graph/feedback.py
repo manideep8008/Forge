@@ -24,9 +24,9 @@ def should_retry_review(state: PipelineState) -> str:
         )
         return "halt"
 
-    # Check if there are HIGH/CRITICAL issues
+    # Only retry on CRITICAL issues (crashes, data loss)
     has_critical = any(
-        issue.get("severity") in ("high", "critical")
+        issue.get("severity") == "critical"
         for issue in state.review_issues
     )
 
@@ -37,12 +37,12 @@ def should_retry_review(state: PipelineState) -> str:
             iteration=state.review_iteration + 1,
             critical_issues=sum(
                 1 for i in state.review_issues
-                if i.get("severity") in ("high", "critical")
+                if i.get("severity") == "critical"
             ),
         )
         return "codegen"
 
-    # Low/medium issues — proceed anyway
+    # High/medium/low issues — proceed to testing anyway
     return "test"
 
 

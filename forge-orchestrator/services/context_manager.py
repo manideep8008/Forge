@@ -1,5 +1,7 @@
 """Redis-backed context manager for agent shared state."""
 
+from __future__ import annotations
+
 import json
 import os
 from typing import Any
@@ -83,6 +85,61 @@ class ContextManager:
             "payload": payload,
         })
         await r.publish(f"ws:{pipeline_id}", event)
+
+    async def wait_for_field(
+        self,
+        pipeline_id: str,
+        field: str,
+        expected_values: set[str],
+        timeout: int = 3600,
+        poll_fallback: int = 10,
+    ) -> str | None:
+        """Wait for a Redis hash field to match one of the expected values.
+
+        Uses pub/sub on the ``ws:{pipeline_id}`` channel for instant wake-up,
+        with a slow poll fallback every *poll_fallback* seconds in case the
+        pub/sub message was missed.
+
+        Returns the matched value, or ``None`` on timeout.
+        """
+        import asyncio
+
+        r = await self._get_redis()
+        pubsub = r.pubsub()
+        channel = f"ws:{pipeline_id}"
+        await pubsub.subscribe(channel)
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        try:
+            while asyncio.get_event_loop().time() < deadline:
+                # Check current value first (covers race where value was set
+                # before we subscribed).
+                current = await self.get(pipeline_id, field)
+                if current and current in expected_values:
+                    return current
+
+                # Wait for a pub/sub message or fall back after poll_fallback seconds.
+                remaining = deadline - asyncio.get_event_loop().time()
+                wait_time = min(poll_fallback, remaining)
+                if wait_time <= 0:
+                    break
+
+                try:
+                    msg = await asyncio.wait_for(
+                        pubsub.get_message(ignore_subscribe_messages=True, timeout=wait_time),
+                        timeout=wait_time + 1,
+                    )
+                except asyncio.TimeoutError:
+                    pass  # Fall through to re-check the field.
+        finally:
+            await pubsub.unsubscribe(channel)
+            await pubsub.close()
+
+        # Final check after timeout.
+        current = await self.get(pipeline_id, field)
+        if current and current in expected_values:
+            return current
+        return None
 
     async def close(self) -> None:
         if self._redis:

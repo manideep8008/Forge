@@ -4,6 +4,7 @@ import json
 import os
 
 from agents.base import BaseAgent
+from agents.codegen import _extract_json
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
@@ -61,14 +62,8 @@ Respond with valid JSON only."""
         )
 
         response_text = result["response"].strip()
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-
-        try:
-            plan = json.loads(response_text)
-        except json.JSONDecodeError:
+        plan = _extract_json(response_text)
+        if plan is None:
             plan = {
                 "file_plan": {"files_to_create": [], "files_to_modify": [], "files_to_delete": []},
                 "architecture_decisions": [response_text[:500]],
@@ -76,8 +71,12 @@ Respond with valid JSON only."""
                 "implementation_order": [],
             }
 
+        success = bool(
+            plan.get("file_plan", {}).get("files_to_create")
+            or plan.get("file_plan", {}).get("files_to_modify")
+        )
         return AgentResult(
-            success=True,
+            success=success,
             output=plan,
             tokens_used=result["tokens_used"],
             model_used=result["model"],

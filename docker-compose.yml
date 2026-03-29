@@ -56,15 +56,15 @@ services:
       CHROMA_PORT: 8000
       GIT_SVC_URL: http://forge-git-svc:8081
       DOCKER_SVC_URL: http://forge-docker-svc:8082
-      MODEL_REQUIREMENTS: ${MODEL_REQUIREMENTS:-llama3:8b}
-      MODEL_ARCHITECT: ${MODEL_ARCHITECT:-llama3:8b}
-      MODEL_CODEGEN: ${MODEL_CODEGEN:-codellama:13b}
-      MODEL_REVIEW: ${MODEL_REVIEW:-phi3:mini}
-      MODEL_TEST: ${MODEL_TEST:-codellama:13b}
-      MODEL_CICD: ${MODEL_CICD:-llama3:8b}
-      MODEL_MONITOR: ${MODEL_MONITOR:-phi3:mini}
-      MODEL_INTENT: ${MODEL_INTENT:-llama3:8b}
-      MODEL_EMBEDDING: ${MODEL_EMBEDDING:-all-minilm:l6-v2}
+      MODEL_REQUIREMENTS: ${MODEL_REQUIREMENTS:-qwen3.5:397b-cloud}
+      MODEL_ARCHITECT: ${MODEL_ARCHITECT:-qwen3.5:397b-cloud}
+      MODEL_CODEGEN: ${MODEL_CODEGEN:-qwen3.5:397b-cloud}
+      MODEL_REVIEW: ${MODEL_REVIEW:-qwen3.5:397b-cloud}
+      MODEL_TEST: ${MODEL_TEST:-qwen3.5:397b-cloud}
+      MODEL_CICD: ${MODEL_CICD:-devstral-small-2:24b-cloud}
+      MODEL_MONITOR: ${MODEL_MONITOR:-devstral-small-2:24b-cloud}
+      MODEL_INTENT: ${MODEL_INTENT:-qwen3.5:397b-cloud}
+      MODEL_EMBEDDING: ${MODEL_EMBEDDING:-nomic-embed-text}
     depends_on:
       forge-redis:
         condition: service_healthy
@@ -91,7 +91,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-forge-dev-secret-change-in-production}
       RATE_LIMIT_PIPELINE: ${RATE_LIMIT_PIPELINE:-10}
       RATE_LIMIT_QUERY: ${RATE_LIMIT_QUERY:-100}
-      DEV_MODE: "true"
+      DEV_MODE: "${DEV_MODE:-false}"
     depends_on:
       forge-redis:
         condition: service_healthy
@@ -141,11 +141,12 @@ services:
       - "${DOCKER_SVC_PORT:-8082}:8082"
     environment:
       REDIS_URL: redis://forge-redis:6379
+      REDIS_ADDR: forge-redis:6379
     depends_on:
       forge-redis:
         condition: service_healthy
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - workspace:/workspace
 
   # === Frontend ===

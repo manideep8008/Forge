@@ -1,7 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import type { Pipeline, PipelineEvent, PipelineStage, StageName } from '../types';
 import { useWebSocket } from './useWebSocket';
 import { STAGE_ORDER } from '../types';
+
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'halted', 'rolled_back']);
 
 interface UsePipelineReturn {
   pipeline: Pipeline | null;
@@ -19,11 +21,11 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
   const [error, setError] = useState<string | null>(null);
   const { connected, events, lastEvent } = useWebSocket(pipelineId);
 
-  const fetchPipeline = useCallback(async () => {
+  const fetchPipeline = useCallback(async (isPolling = false) => {
     if (!pipelineId) return;
 
     try {
-      setLoading(true);
+      if (!isPolling) setLoading(true);
       setError(null);
       const res = await fetch(`/api/pipeline/${pipelineId}`);
       if (!res.ok) throw new Error(`Failed to fetch pipeline: ${res.statusText}`);
@@ -52,18 +54,32 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
     }
   }, [pipelineId]);
 
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   useEffect(() => {
-    fetchPipeline();
+    fetchPipeline(false);
     // Poll every 3s while pipeline is active (not completed/failed)
-    const interval = setInterval(() => {
-      fetchPipeline();
+    intervalRef.current = setInterval(() => {
+      fetchPipeline(true);
     }, 3000);
-    return () => clearInterval(interval);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
   }, [fetchPipeline]);
+
+  // Stop polling when pipeline reaches a terminal state
+  useEffect(() => {
+    if (pipeline && TERMINAL_STATUSES.has(pipeline.status)) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    }
+  }, [pipeline?.status]);
 
   // Apply real-time WebSocket updates to pipeline state
   useEffect(() => {
-    if (!lastEvent || !pipeline) return;
+    if (!lastEvent) return;
 
     setPipeline((prev) => {
       if (!prev) return prev;
@@ -148,7 +164,7 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
 
       return updated;
     });
-  }, [lastEvent, pipeline]);
+  }, [lastEvent]);
 
   return {
     pipeline,

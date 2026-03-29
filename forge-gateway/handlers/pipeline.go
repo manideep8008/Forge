@@ -12,7 +12,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-var orchestratorURL = envOrDefault("ORCHESTRATOR_URL", "http://orchestrator:8081")
+var orchestratorURL = envOrDefault("ORCHESTRATOR_URL", "http://forge-orchestrator:8090")
 
 // ---------- request / response types ----------
 
@@ -22,6 +22,7 @@ type CreatePipelineRequest struct {
 	Branch      string `json:"branch"`
 	Prompt      string `json:"prompt"`
 	Description string `json:"description"`
+	InputText   string `json:"input_text"`
 	CallbackURL string `json:"callback_url,omitempty"`
 }
 
@@ -52,12 +53,15 @@ func CreatePipeline(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid JSON payload", http.StatusBadRequest)
 		return
 	}
-	// Allow "description" as an alias for "prompt" (frontend sends description).
+	// Allow "description" or "input_text" as aliases for "prompt".
 	if req.Prompt == "" && req.Description != "" {
 		req.Prompt = req.Description
 	}
+	if req.Prompt == "" && req.InputText != "" {
+		req.Prompt = req.InputText
+	}
 	if req.Prompt == "" {
-		jsonError(w, "prompt or description is required", http.StatusBadRequest)
+		jsonError(w, "prompt, description, or input_text is required", http.StatusBadRequest)
 		return
 	}
 
@@ -153,6 +157,81 @@ func ListPipelines(w http.ResponseWriter, r *http.Request) {
 	relayResponse(w, resp)
 }
 
+// DeletePipeline cancels and removes a pipeline.
+// DELETE /api/pipeline/{id}
+func DeletePipeline(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	url := fmt.Sprintf("%s/pipeline/%s", orchestratorURL, id)
+
+	resp, err := proxyDelete(url, r)
+	if err != nil {
+		log.Error().Err(err).Msg("orchestrator unreachable")
+		jsonError(w, "orchestrator unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	relayResponse(w, resp)
+}
+
+// CancelPipeline cancels a running pipeline.
+// POST /api/pipeline/{id}/cancel
+func CancelPipeline(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	url := fmt.Sprintf("%s/pipeline/%s/cancel", orchestratorURL, id)
+
+	resp, err := proxyPost(url, nil, r)
+	if err != nil {
+		log.Error().Err(err).Msg("orchestrator unreachable")
+		jsonError(w, "orchestrator unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	relayResponse(w, resp)
+}
+
+// RetryPipeline restarts a failed pipeline.
+// POST /api/pipeline/{id}/retry
+func RetryPipeline(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	url := fmt.Sprintf("%s/pipeline/%s/retry", orchestratorURL, id)
+
+	resp, err := proxyPost(url, nil, r)
+	if err != nil {
+		log.Error().Err(err).Msg("orchestrator unreachable")
+		jsonError(w, "orchestrator unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	relayResponse(w, resp)
+}
+
+// ModifyPipeline starts a new iteration pipeline that modifies an existing app.
+// POST /api/pipeline/{id}/modify
+func ModifyPipeline(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		jsonError(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	url := fmt.Sprintf("%s/pipeline/%s/modify", orchestratorURL, id)
+	resp, err := proxyPost(url, body, r)
+	if err != nil {
+		log.Error().Err(err).Msg("orchestrator unreachable")
+		jsonError(w, "orchestrator unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	relayResponse(w, resp)
+}
+
 // ---------- helpers ----------
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -165,6 +244,15 @@ func proxyPost(url string, body []byte, orig *http.Request) (*http.Response, err
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	propagateHeaders(orig, req)
+	return httpClient.Do(req)
+}
+
+func proxyDelete(url string, orig *http.Request) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(orig.Context(), http.MethodDelete, url, nil)
+	if err != nil {
+		return nil, err
+	}
 	propagateHeaders(orig, req)
 	return httpClient.Do(req)
 }

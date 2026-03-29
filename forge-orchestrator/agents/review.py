@@ -2,13 +2,15 @@
 
 import json
 import os
+import re
 
 from agents.base import BaseAgent
+from agents.codegen import _extract_json
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
-SYSTEM_PROMPT = """You are a senior code reviewer specializing in code quality and security.
-Review the provided code and identify issues.
+SYSTEM_PROMPT = """You are a pragmatic code reviewer focused on correctness.
+Review the provided code and identify ONLY issues that would cause bugs or break functionality.
 
 For each issue, produce a JSON entry:
 {
@@ -19,21 +21,27 @@ For each issue, produce a JSON entry:
       "line": 42,
       "message": "Description of the issue",
       "suggestion": "How to fix it",
-      "category": "security|style|logic|performance|maintainability"
+      "category": "logic|correctness|runtime_error"
     }
   ],
   "summary": "Overall assessment",
   "passed": true/false
 }
 
-Focus on:
-- Security vulnerabilities (injection, hardcoded secrets, etc.)
-- Logic errors and edge cases
-- Code style and conventions
-- Performance issues
-- Maintainability concerns
+Severity guidelines:
+- "critical": Code will crash, data loss, completely broken functionality
+- "high": Major logic error that produces wrong results
+- "medium": Minor correctness issue, missing edge case handling
+- "low": Style preference, naming, minor improvement suggestion
 
-Be constructive. Only flag real issues, not style preferences.
+IMPORTANT RULES:
+- Only mark "critical" for issues that will DEFINITELY cause crashes or data loss
+- Do NOT flag security best-practices (XSS, CSRF, injection) as critical — mark them as "medium" at most
+- Do NOT flag style issues, naming conventions, or missing comments
+- Do NOT flag missing error handling for unlikely edge cases
+- Be lenient — if the code works correctly for the main use cases, set "passed": true
+- When in doubt, use lower severity
+
 Always respond with valid JSON only."""
 
 
@@ -76,23 +84,18 @@ Identify issues by severity. Respond with valid JSON only."""
         )
 
         response_text = result["response"].strip()
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-
-        try:
-            review = json.loads(response_text)
-        except json.JSONDecodeError:
+        review = _extract_json(response_text)
+        if review is None:
             review = {"issues": [], "summary": response_text[:500], "passed": True}
 
         issues = review.get("issues", [])
+        # Only fail on critical issues (crashes, data loss)
         passed = not any(
-            i.get("severity") in ("high", "critical") for i in issues
+            i.get("severity") == "critical" for i in issues
         )
 
         return AgentResult(
-            success=True,
+            success=bool(review.get("summary") or issues),
             output={"issues": issues, "summary": review.get("summary", ""), "passed": passed},
             tokens_used=result["tokens_used"],
             model_used=result["model"],

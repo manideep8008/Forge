@@ -151,9 +151,19 @@ func commitHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Info().Str("pipeline_id", req.PipelineID).Int("file_count", len(req.Files)).Msg("committing files")
 
-	// Write files to workspace
+	// Write files to workspace (with path traversal protection)
+	realWorkspace, _ := filepath.EvalSymlinks(workspaceDir)
 	for relPath, content := range req.Files {
 		absPath := filepath.Join(workspaceDir, relPath)
+		realPath, _ := filepath.EvalSymlinks(filepath.Dir(absPath))
+		if realPath == "" {
+			realPath = filepath.Clean(absPath)
+		}
+		if !strings.HasPrefix(filepath.Clean(absPath), realWorkspace) {
+			log.Warn().Str("path", relPath).Msg("path traversal blocked")
+			writeError(w, http.StatusBadRequest, "invalid file path")
+			return
+		}
 		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 			log.Error().Err(err).Str("path", absPath).Msg("failed to create directory")
 			writeError(w, http.StatusInternalServerError, "failed to write file")
@@ -180,9 +190,9 @@ func commitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Push
+	// Push — failure is non-fatal (no remote configured in dev) but we surface it clearly
 	if out, err := gitExec("push", "--set-upstream", "origin", "HEAD"); err != nil {
-		log.Warn().Err(err).Str("output", out).Msg("git push failed (may be expected in dev)")
+		log.Error().Err(err).Str("output", out).Msg("git push failed — no remote configured; code only exists in the local workspace volume")
 	}
 
 	publishEvent(r.Context(), "git.commit.created", map[string]string{

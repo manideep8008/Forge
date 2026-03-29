@@ -22,7 +22,7 @@ export default function NewPipelineModal({ onClose, onCreated }: NewPipelineModa
       const res = await fetch('/api/pipeline', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           input_text: description.trim(),
           user_id: 'test-user' // hardcoded for now, normally from auth
         }),
@@ -40,17 +40,19 @@ export default function NewPipelineModal({ onClose, onCreated }: NewPipelineModa
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="card w-full max-w-lg shadow-2xl">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md animate-fade-in">
+      <div className="card w-full max-w-lg shadow-glass-lg border-forge-border-bright animate-scale-in">
         {/* Header */}
         <div className="flex items-center justify-between p-5 border-b border-forge-border">
           <div className="flex items-center gap-3">
-            <Rocket className="w-5 h-5 text-forge-accent" />
+            <div className="p-2 bg-indigo-500/10 rounded-xl">
+              <Rocket className="w-5 h-5 text-indigo-400" />
+            </div>
             <h2 className="text-lg font-bold">New Pipeline</h2>
           </div>
           <button
             onClick={onClose}
-            className="p-1 rounded hover:bg-slate-700 transition-colors"
+            className="p-1.5 rounded-lg hover:bg-white/5 transition-colors"
           >
             <X className="w-5 h-5 text-forge-muted" />
           </button>
@@ -69,28 +71,28 @@ export default function NewPipelineModal({ onClose, onCreated }: NewPipelineModa
               placeholder="Describe the feature you want to build. Be as specific as possible about requirements, constraints, and expected behavior..."
               rows={6}
               autoFocus
-              className="w-full bg-forge-bg border border-forge-border rounded-lg px-3 py-2
-                text-sm text-forge-text placeholder-forge-muted resize-none
-                focus:outline-none focus:ring-1 focus:ring-forge-accent focus:border-forge-accent"
+              className="input-modern resize-none"
             />
           </div>
 
           {error && (
-            <p className="text-sm text-red-400 bg-red-400/5 rounded-lg px-3 py-2">{error}</p>
+            <p className="text-sm text-red-400 bg-red-500/5 border border-red-500/10 rounded-xl px-3 py-2.5">
+              {error}
+            </p>
           )}
 
-          <div className="flex items-center justify-end gap-3">
+          <div className="flex items-center justify-end gap-3 pt-1">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 text-sm text-forge-muted hover:text-forge-text transition-colors"
+              className="btn-ghost text-sm"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={submitting || !description.trim()}
-              className="btn-primary flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="btn-primary flex items-center gap-2 disabled:opacity-50 disabled:pointer-events-none text-sm"
             >
               {submitting ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
