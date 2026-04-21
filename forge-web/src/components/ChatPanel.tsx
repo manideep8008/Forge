@@ -1,7 +1,8 @@
 import { useRef, useEffect, useState } from 'react';
 import {
   Send, Loader2, User, Bot, CheckCircle2, XCircle,
-  AlertTriangle, ChevronDown, ChevronUp, History,
+  AlertTriangle, ChevronDown, ChevronUp, History, Trash2,
+  GitFork, MessageSquare,
 } from 'lucide-react';
 import type { Pipeline, AgentOutput } from '../types';
 import HITLGate from './HITLGate';
@@ -11,10 +12,14 @@ interface ChatPanelProps {
   pipeline: Pipeline | null;
   connected: boolean;
   onSubmit: (text: string) => void;
-  onModify: (pipelineId: string, message: string) => void;
+  onModify: (pipelineId: string, message: string) => Promise<boolean>;
   submitting: boolean;
-  pipelines: Array<{ id: string; status: string; name?: string; description?: string; input_text?: string }>;
+  pipelines: Array<{ id: string; status: string; name?: string; description?: string; input_text?: string; parent_pipeline_id?: string | null }>;
   onSelectPipeline: (id: string) => void;
+  onDeletePipeline: (id: string) => void;
+  onForkPipeline?: (id: string) => Promise<void>;
+  onToggleComments?: () => void;
+  showComments?: boolean;
 }
 
 const AGENT_ICONS: Record<string, string> = {
@@ -32,9 +37,15 @@ const AGENT_ICONS: Record<string, string> = {
 const STATUS_DOT: Record<string, string> = {
   completed: 'bg-emerald-400',
   failed: 'bg-red-400',
-  running: 'bg-indigo-400 animate-pulse',
+  running: 'bg-forge-text animate-pulse',
   pending: 'bg-forge-muted/40',
 };
+
+const SUGGESTIONS = [
+  "Add Dark Mode 🌙",
+  "Add User Authentication 🔒",
+  "Make Mobile Responsive 📱"
+];
 
 function AgentBubble({ agent }: { agent: AgentOutput }) {
   const [expanded, setExpanded] = useState(false);
@@ -80,7 +91,7 @@ function AgentBubble({ agent }: { agent: AgentOutput }) {
         <div className="flex items-center gap-2 mb-0.5">
           <span className="text-xs font-semibold capitalize">{agent.agent}</span>
           {agent.status === 'running' && (
-            <Loader2 className="w-3 h-3 text-indigo-400 animate-spin" />
+            <Loader2 className="w-3 h-3 text-forge-muted animate-spin" />
           )}
           {agent.status === 'completed' && (
             <CheckCircle2 className="w-3 h-3 text-emerald-400" />
@@ -92,7 +103,7 @@ function AgentBubble({ agent }: { agent: AgentOutput }) {
         {summary && (
           <p className="text-xs text-forge-muted leading-relaxed">{summary}</p>
         )}
-        {agent.output && (
+        {agent.agent !== 'codegen' && agent.output && (
           <button
             onClick={() => setExpanded(!expanded)}
             className="mt-1 flex items-center gap-1 text-xs text-forge-muted/60 hover:text-forge-muted transition-colors"
@@ -101,10 +112,20 @@ function AgentBubble({ agent }: { agent: AgentOutput }) {
             {expanded ? 'Hide details' : 'Show details'}
           </button>
         )}
-        {expanded && agent.output && (
+        {agent.agent !== 'codegen' && expanded && agent.output && (
           <pre className="mt-2 text-xs bg-forge-bg/80 border border-forge-border rounded-lg p-2 overflow-auto max-h-48 text-forge-muted/80 leading-relaxed font-mono whitespace-pre-wrap">
             {JSON.stringify(agent.output, null, 2)}
           </pre>
+        )}
+        {agent.agent === 'codegen' && agent.output && (agent.output as Record<string, any>).files && (
+          <div className="mt-2 flex flex-col gap-1.5">
+            {Object.keys((agent.output as Record<string, any>).files).map((path) => (
+              <div key={path} className="flex items-center gap-2 bg-forge-surface/80 border border-forge-border rounded-md px-2.5 py-1.5 w-fit shadow-sm">
+                <span className="text-xs">📄</span>
+                <span className="text-[11px] text-forge-text font-mono tracking-wide">Wrote <span className="text-forge-text-dim">{path}</span></span>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>
@@ -119,6 +140,10 @@ export default function ChatPanel({
   submitting,
   pipelines,
   onSelectPipeline,
+  onDeletePipeline,
+  onForkPipeline,
+  onToggleComments,
+  showComments,
 }: ChatPanelProps) {
   const [input, setInput] = useState('');
   const [modifyInput, setModifyInput] = useState('');
@@ -126,7 +151,19 @@ export default function ChatPanel({
   const [showHistory, setShowHistory] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  const isHITL = (pipeline?.status as string) === 'awaiting_approval' || pipeline?.current_stage === 'hitl';
+  const [hitlDismissed, setHitlDismissed] = useState(false);
+  const isHITL = !hitlDismissed && ((pipeline?.status as string) === 'awaiting_approval' || pipeline?.current_stage === 'hitl');
+
+  // Reset dismissed state when pipeline transitions out of awaiting_approval
+  useEffect(() => {
+    if (pipeline?.status !== 'awaiting_approval' && pipeline?.current_stage !== 'hitl') {
+      setHitlDismissed(false);
+    }
+  }, [pipeline?.status, pipeline?.current_stage]);
+
+  useEffect(() => {
+    setModifying(false);
+  }, [pipeline?.id]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -145,18 +182,31 @@ export default function ChatPanel({
     }
   };
 
-  const handleModify = () => {
+  const startModify = async (text: string) => {
+    if (!pipeline?.id || modifying) return;
+
+    setModifying(true);
+    try {
+      const started = await onModify(pipeline.id, text);
+      if (!started) {
+        setModifyInput(text);
+      }
+    } finally {
+      setModifying(false);
+    }
+  };
+
+  const handleModify = async () => {
     const text = modifyInput.trim();
     if (!text || modifying || !pipeline?.id) return;
-    setModifying(true);
     setModifyInput('');
-    onModify(pipeline.id, text);
-    // modifying state is reset by parent when new pipeline arrives
-    setTimeout(() => setModifying(false), 2000);
+    await startModify(text);
   };
 
   const handleModifyKey = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleModify();
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      void handleModify();
+    }
   };
 
   return (
@@ -166,33 +216,100 @@ export default function ChatPanel({
         <span className="text-xs font-semibold text-forge-muted uppercase tracking-widest flex items-center gap-1.5">
           <Bot className="w-3.5 h-3.5" /> Chat
         </span>
-        <button
-          onClick={() => setShowHistory(!showHistory)}
-          className="flex items-center gap-1 text-xs text-forge-muted/60 hover:text-forge-muted transition-colors"
-        >
-          <History className="w-3 h-3" />
-          History
-        </button>
+        <div className="flex items-center gap-1">
+          {pipeline && onForkPipeline && (
+            <button
+              onClick={() => { void onForkPipeline(pipeline.id); }}
+              title="Fork this pipeline"
+              className="flex items-center gap-1 text-xs text-forge-muted/60 hover:text-forge-text transition-colors px-1.5 py-1 rounded hover:bg-white/5"
+            >
+              <GitFork className="w-3 h-3" />
+              Fork
+            </button>
+          )}
+          {pipeline && onToggleComments && (
+            <button
+              onClick={onToggleComments}
+              title="Toggle comments"
+              className={`flex items-center gap-1 text-xs transition-colors px-1.5 py-1 rounded hover:bg-white/5 ${showComments ? 'text-forge-text' : 'text-forge-muted/60 hover:text-forge-text'}`}
+            >
+              <MessageSquare className="w-3 h-3" />
+              Notes
+            </button>
+          )}
+          <button
+            onClick={() => setShowHistory(!showHistory)}
+            className="flex items-center gap-1 text-xs text-forge-muted/60 hover:text-forge-muted transition-colors px-1.5 py-1 rounded hover:bg-white/5"
+          >
+            <History className="w-3 h-3" />
+            History
+          </button>
+        </div>
       </div>
 
       {/* History drawer */}
       {showHistory && (
-        <div className="border-b border-forge-border/50 bg-forge-bg/60 max-h-48 overflow-y-auto shrink-0">
+        <div className="border-b border-forge-border/50 bg-forge-bg/60 max-h-64 overflow-y-auto shrink-0 py-2">
           {pipelines.length === 0 ? (
             <p className="text-xs text-forge-muted p-3 text-center">No previous pipelines</p>
           ) : (
-            pipelines.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => { onSelectPipeline(p.id); setShowHistory(false); }}
-                className={`w-full text-left px-3 py-2 text-xs hover:bg-white/5 transition-colors border-b border-forge-border/30 last:border-0 ${
-                  p.id === pipeline?.id ? 'bg-indigo-500/10 text-indigo-300' : 'text-forge-muted'
-                }`}
-              >
-                <div className="font-medium truncate">{p.name || p.input_text || `Pipeline ${p.id.slice(0, 8)}`}</div>
-                <div className="text-forge-muted/60 mt-0.5">{p.status}</div>
-              </button>
-            ))
+            (() => {
+              const roots = pipelines.filter(p => !p.parent_pipeline_id);
+              const children = pipelines.filter(p => p.parent_pipeline_id).reduce((acc, p) => {
+                const parentId = p.parent_pipeline_id!;
+                if (!acc[parentId]) acc[parentId] = [];
+                acc[parentId].push(p);
+                return acc;
+              }, {} as Record<string, typeof pipelines>);
+
+              return roots.map((p) => (
+                <div key={p.id} className="mb-1">
+                  {/* Parent Project */}
+                  <div className="group relative flex items-center">
+                    <button
+                      onClick={() => { onSelectPipeline(p.id); setShowHistory(false); }}
+                      className={`flex-1 text-left px-3 py-2 text-xs hover:bg-white/5 transition-colors border-l-2 ${
+                        p.id === pipeline?.id ? 'bg-white/5 text-forge-text border-forge-border-bright' : 'text-forge-muted border-transparent'
+                      }`}
+                    >
+                      <div className="font-semibold truncate pr-6">{p.name || p.input_text || `Project ${p.id.slice(0, 8)}`}</div>
+                      <div className="text-forge-muted/60 mt-0.5">{p.status}</div>
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onDeletePipeline(p.id); }}
+                      className="absolute right-2 opacity-0 group-hover:opacity-100 p-1.5 text-forge-muted hover:text-red-400 hover:bg-red-400/10 rounded transition-all"
+                      title="Delete Project"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  {/* Children / Iterations */}
+                  {children[p.id] && children[p.id].map(child => (
+                    <div key={child.id} className="group relative flex items-center">
+                      <button
+                        onClick={() => { onSelectPipeline(child.id); setShowHistory(false); }}
+                        className={`flex-1 text-left pl-6 pr-3 py-1.5 text-xs hover:bg-white/5 transition-colors border-l-2 relative ${
+                          child.id === pipeline?.id ? 'bg-white/5 text-forge-text border-forge-border-bright' : 'text-forge-muted/80 border-transparent'
+                        }`}
+                      >
+                        <div className="absolute left-2.5 top-0 bottom-0 border-l border-forge-border/40" />
+                        <div className="absolute left-2.5 top-1/2 w-2 border-t border-forge-border/40" />
+                        <div className="font-medium truncate pl-1 pr-6">↳ {child.input_text || `Iteration ${child.id.slice(0, 8)}`}</div>
+                        <div className="text-forge-muted/50 mt-0.5 pl-1">{child.status}</div>
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onDeletePipeline(child.id); }}
+                        className="absolute right-2 opacity-0 group-hover:opacity-100 p-1 text-forge-muted hover:text-red-400 hover:bg-red-400/10 rounded transition-all"
+                        title="Delete Iteration"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ));
+            })()
           )}
         </div>
       )}
@@ -201,7 +318,7 @@ export default function ChatPanel({
       <div className="flex-1 overflow-y-auto p-3 space-y-4 min-h-0">
         {!pipeline ? (
           <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
-            <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-indigo-500/10 to-purple-500/10 border border-indigo-500/20 flex items-center justify-center text-2xl">
+            <div className="w-12 h-12 rounded-2xl bg-forge-surface border border-forge-border flex items-center justify-center text-2xl">
               🔨
             </div>
             <div>
@@ -213,11 +330,11 @@ export default function ChatPanel({
           <>
             {/* User prompt bubble */}
             <div className="flex gap-2.5 justify-end">
-              <div className="max-w-[85%] bg-indigo-500/15 border border-indigo-500/25 rounded-2xl rounded-tr-sm px-3 py-2">
+              <div className="max-w-[85%] bg-forge-surface border border-forge-border rounded-2xl rounded-tr-sm px-3 py-2">
                 <p className="text-xs leading-relaxed">{pipeline.description || pipeline.input_text}</p>
               </div>
-              <div className="w-7 h-7 rounded-lg bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center shrink-0">
-                <User className="w-3.5 h-3.5 text-indigo-400" />
+              <div className="w-7 h-7 rounded-lg bg-forge-surface border border-forge-border flex items-center justify-center shrink-0">
+                <User className="w-3.5 h-3.5 text-forge-text-dim" />
               </div>
             </div>
 
@@ -228,7 +345,7 @@ export default function ChatPanel({
                   🤖
                 </div>
                 <div className="flex items-center gap-2 bg-forge-surface/60 border border-forge-border rounded-2xl rounded-tl-sm px-3 py-2">
-                  <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin" />
+                  <Loader2 className="w-3.5 h-3.5 text-forge-muted animate-spin" />
                   <span className="text-xs text-forge-muted">Analysing your request…</span>
                 </div>
               </div>
@@ -249,8 +366,8 @@ export default function ChatPanel({
                 <HITLGate
                   pipelineId={pipeline.id}
                   agents={pipeline.agents}
-                  onClose={() => {}}
-                  onDecision={(_d: HITLDecision) => {}}
+                  onClose={() => setHitlDismissed(true)}
+                  onDecision={(_d: HITLDecision) => setHitlDismissed(true)}
                   compact
                 />
               </div>
@@ -268,10 +385,30 @@ export default function ChatPanel({
               </div>
             )}
 
-            {/* ── Continuation input (after completion) ── */}
+            {/* Continuation input (after completion) */}
             {pipeline.status === 'completed' && (
-              <div className="border border-indigo-500/20 bg-indigo-500/5 rounded-xl p-3 animate-slide-up">
-                <p className="text-xs font-semibold text-indigo-400 mb-2">✏️ What would you like to change?</p>
+              <div className="border border-forge-border bg-forge-surface/30 rounded-xl p-3 animate-slide-up">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs font-semibold text-forge-text flex items-center gap-1.5">
+                    <span className="text-sm">✏️</span> What would you like to change?
+                  </p>
+                  <div className="flex gap-1.5 flex-wrap justify-end">
+                    {SUGGESTIONS.map((sug) => (
+                      <button
+                        key={sug}
+                        onClick={() => {
+                          if (modifying) return;
+                          setModifyInput('');
+                          void startModify(sug);
+                        }}
+                        disabled={modifying}
+                        className="text-[10px] px-2 py-1 rounded-full bg-forge-surface text-forge-muted border border-forge-border hover:bg-forge-bg hover:border-forge-border-bright transition-colors disabled:opacity-50"
+                      >
+                        {sug}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <div className="relative">
                   <textarea
                     value={modifyInput}
@@ -279,17 +416,17 @@ export default function ChatPanel({
                     onKeyDown={handleModifyKey}
                     placeholder="e.g. add dark mode, change button color, add a /health endpoint… (⌘↵ to send)"
                     rows={2}
-                    className="w-full resize-none bg-forge-bg border border-indigo-500/30 rounded-lg px-3 py-2 pr-10 text-xs text-forge-text placeholder-forge-muted/50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 transition-all leading-relaxed"
+                    className="w-full resize-none bg-forge-bg border border-forge-border rounded-lg px-3 py-2 pr-10 text-xs text-forge-text placeholder-forge-muted/50 focus:outline-none focus:border-forge-border-bright transition-all leading-relaxed"
                     disabled={modifying}
                   />
                   <button
-                    onClick={handleModify}
+                    onClick={() => { void handleModify(); }}
                     disabled={!modifyInput.trim() || modifying}
-                    className="absolute bottom-2 right-2 p-1.5 rounded-lg bg-indigo-500/80 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    className="absolute bottom-2 right-2 p-1.5 rounded-lg bg-forge-surface border border-forge-border hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
                   >
                     {modifying
-                      ? <Loader2 className="w-3.5 h-3.5 text-white animate-spin" />
-                      : <Send className="w-3.5 h-3.5 text-white" />}
+                      ? <Loader2 className="w-3.5 h-3.5 text-forge-text animate-spin" />
+                      : <Send className="w-3.5 h-3.5 text-forge-text" />}
                   </button>
                 </div>
               </div>
@@ -317,7 +454,7 @@ export default function ChatPanel({
                   {[0, 150, 300].map(d => (
                     <div
                       key={d}
-                      className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce"
+                      className="w-1.5 h-1.5 rounded-full bg-forge-muted animate-bounce"
                       style={{ animationDelay: `${d}ms` }}
                     />
                   ))}
@@ -343,17 +480,17 @@ export default function ChatPanel({
             onKeyDown={handleKey}
             placeholder="Describe what you want to build… (⌘↵ to send)"
             rows={3}
-            className="w-full resize-none bg-forge-bg border border-forge-border rounded-xl px-3 py-2.5 pr-10 text-xs text-forge-text placeholder-forge-muted/50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/40 transition-all leading-relaxed"
+            className="w-full resize-none bg-forge-bg border border-forge-border rounded-xl px-3 py-2.5 pr-10 text-xs text-forge-text placeholder-forge-muted/50 focus:outline-none focus:border-forge-border-bright transition-all leading-relaxed"
             disabled={submitting}
           />
           <button
             onClick={handleSend}
             disabled={!input.trim() || submitting}
-            className="absolute bottom-2.5 right-2.5 p-1.5 rounded-lg bg-indigo-500/80 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+            className="absolute bottom-2.5 right-2.5 p-1.5 rounded-lg bg-forge-surface border border-forge-border hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
           >
             {submitting
-              ? <Loader2 className="w-3.5 h-3.5 text-white animate-spin" />
-              : <Send className="w-3.5 h-3.5 text-white" />}
+              ? <Loader2 className="w-3.5 h-3.5 text-forge-text animate-spin" />
+              : <Send className="w-3.5 h-3.5 text-forge-text" />}
           </button>
         </div>
         <p className="text-xs text-forge-muted/40 mt-1.5 text-right">

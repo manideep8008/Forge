@@ -13,12 +13,12 @@ Given a user's feature request, classify it into exactly one category:
 - refactor: Restructuring existing code without changing behavior
 - hotfix: Urgent fix for production issues
 
-Respond with ONLY the category name, nothing else."""
+Respond with ONLY the category name, nothing else. Do not include any explanation, reasoning, or punctuation."""
 
 
 async def classify_intent(input_text: str) -> IntentType:
     """Classify user input into an IntentType."""
-    model = os.getenv("MODEL_INTENT", "llama3:8b")
+    model = os.getenv("MODEL_INTENT", "gemma4:31b-cloud")
 
     result = await ollama_client.generate(
         prompt=f"Classify this request:\n\n{input_text}",

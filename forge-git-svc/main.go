@@ -16,7 +16,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -52,7 +51,6 @@ func main() {
 	r.Use(requestLogger)
 
 	r.Get("/health", healthHandler)
-	r.Handle("/metrics", promhttp.Handler())
 
 	r.Route("/git", func(r chi.Router) {
 		r.Post("/branch", createBranchHandler)

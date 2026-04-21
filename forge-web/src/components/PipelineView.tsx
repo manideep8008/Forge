@@ -18,7 +18,7 @@ import AgentCard from './AgentCard';
 import HITLGate from './HITLGate';
 import type { HITLDecision } from '../types';
 
-const ACTIVE_STATUSES = new Set(['pending', 'running', 'awaiting_approval']);
+const ACTIVE_STATUSES = new Set(['pending', 'running', 'hitl']);
 
 export default function PipelineView() {
   const { id } = useParams<{ id: string }>();
@@ -29,12 +29,11 @@ export default function PipelineView() {
   const [copied, setCopied] = useState(false);
 
   const isHITLStage = pipeline
-    ? (pipeline.current_stage === 'hitl' || (pipeline.status as string) === 'awaiting_approval') && pipeline.status !== 'completed'
+    ? (pipeline.current_stage === 'hitl' || pipeline.status === 'awaiting_approval') && pipeline.status !== 'completed'
     : false;
 
   const isActive = pipeline ? ACTIVE_STATUSES.has(pipeline.status) : false;
   const isFailed = pipeline?.status === 'failed';
-  const isTerminal = pipeline ? !isActive : false;
 
   // Auto-open HITL modal when pipeline reaches awaiting_approval
   useEffect(() => {
@@ -149,9 +148,8 @@ export default function PipelineView() {
         <div className="flex items-center gap-2 shrink-0">
           {/* Connection status */}
           <span
-            className={`flex items-center gap-1.5 text-xs ${
-              connected ? 'text-emerald-400' : 'text-forge-muted/50'
-            }`}
+            className={`flex items-center gap-1.5 text-xs ${connected ? 'text-emerald-400' : 'text-forge-muted/50'
+              }`}
           >
             {connected ? (
               <>
@@ -176,9 +174,8 @@ export default function PipelineView() {
 
           {/* Status badge */}
           <span
-            className={`badge ${
-              statusStyles[pipeline.status] ?? 'bg-white/5 text-forge-muted border border-forge-border'
-            }`}
+            className={`badge ${statusStyles[pipeline.status] ?? 'bg-white/5 text-forge-muted border border-forge-border'
+              }`}
           >
             {pipeline.status}
           </span>

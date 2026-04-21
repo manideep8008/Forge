@@ -9,7 +9,7 @@ from agents.codegen import _extract_json
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
-SYSTEM_PROMPT = """You are a pragmatic code reviewer focused on correctness.
+SYSTEM_PROMPT = """You are a pragmatic code reviewer for full-stack web applications (React + Vite + Tailwind CSS frontend, Node.js Express backend).
 Review the provided code and identify ONLY issues that would cause bugs or break functionality.
 
 For each issue, produce a JSON entry:
@@ -41,8 +41,10 @@ IMPORTANT RULES:
 - Do NOT flag missing error handling for unlikely edge cases
 - Be lenient — if the code works correctly for the main use cases, set "passed": true
 - When in doubt, use lower severity
+- Report at most 10 issues — focus on the most impactful ones
 
-Always respond with valid JSON only."""
+You may reason internally, but your final output must be valid JSON only.
+Do NOT wrap the JSON in markdown code fences."""
 
 
 class ReviewAgent(BaseAgent):
@@ -52,7 +54,7 @@ class ReviewAgent(BaseAgent):
         return "review"
 
     def get_model(self) -> str:
-        return os.getenv("MODEL_REVIEW", "phi3:mini")
+        return os.getenv("MODEL_REVIEW", "glm-5.1:cloud")
 
     async def validate(self, context: dict) -> bool:
         return bool(context.get("generated_files"))

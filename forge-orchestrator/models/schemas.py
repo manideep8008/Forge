@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -139,7 +139,7 @@ class PipelineEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     pipeline_id: str
     event_type: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     payload: dict[str, Any] = {}
 
@@ -157,3 +157,14 @@ class HITLRequest(BaseModel):
     decision: HITLDecision
     comments: str | None = None
     modifications: dict[str, Any] | None = None
+
+
+# === Exceptions ===
+
+class CodegenOutputError(Exception):
+    """Raised when the LLM returns unparseable or schema-invalid output."""
+
+    def __init__(self, message: str, parse_error: str | None = None, response_snippet: str | None = None):
+        super().__init__(message)
+        self.parse_error = parse_error
+        self.response_snippet = response_snippet

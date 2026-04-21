@@ -1,4 +1,4 @@
-export type StageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+export type StageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'awaiting_approval';
 
 export type StageName =
   | 'requirements'
@@ -27,6 +27,16 @@ export const STAGE_LABELS: Record<StageName, string> = {
   test: 'Test',
   hitl: 'HITL',
   deploy: 'Deploy',
+};
+
+export const STAGE_DESCRIPTIONS: Record<StageName, { working: string; icon: string }> = {
+  requirements: { working: 'Analyzing requirements from your prompt…', icon: '📋' },
+  architect: { working: 'Designing system architecture and file plan…', icon: '🏗️' },
+  codegen: { working: 'Generating source code files…', icon: '⚡' },
+  review: { working: 'Reviewing code for quality and issues…', icon: '🔍' },
+  test: { working: 'Running automated tests…', icon: '🧪' },
+  hitl: { working: 'Awaiting your review and approval…', icon: '👤' },
+  deploy: { working: 'Building and deploying application…', icon: '🚀' },
 };
 
 export interface PipelineStage {
@@ -95,6 +105,19 @@ export type PipelineEventType =
   | 'agent_streaming'
   | 'pipeline_completed'
   | 'pipeline_failed'
+  | 'pipeline_started'
+  | 'pipeline_halted'
+  | 'pipeline.intent_classified'
+  | 'pipeline.started'
+  | 'pipeline.completed'
+  | 'pipeline.halted'
+  | 'pipeline.cancelled'
+  | 'agent.requirements.completed'
+  | 'agent.architect.completed'
+  | 'agent.codegen.completed'
+  | 'agent.review.completed'
+  | 'agent.test.completed'
+  | 'agent.cicd.completed'
   | 'hitl_required';
 
 export interface PipelineEvent {
@@ -102,7 +125,7 @@ export interface PipelineEvent {
   pipeline_id: string;
   stage?: StageName;
   agent?: string;
-  data?: Record<string, unknown>;
+  data?: Record<string, unknown> & { message?: string };
   timestamp: string;
 }
 

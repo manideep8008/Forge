@@ -9,6 +9,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import type { AgentOutput, HITLDecision } from '../types';
+import { useAuth } from '../context/AuthContext';
 
 interface HITLGateProps {
   pipelineId: string;
@@ -20,31 +21,33 @@ interface HITLGateProps {
 }
 
 export default function HITLGate({ pipelineId, agents, onClose, onDecision, compact: _compact }: HITLGateProps) {
+  const { authFetch } = useAuth();
   const [comment, setComment] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const reviewAgent = agents.find((a) => a.stage === 'review');
   const testAgent = agents.find((a) => a.stage === 'test');
 
-  const issues = reviewAgent?.review_issues ?? [];
-  const tests = testAgent?.test_results ?? [];
-  const coverage = testAgent?.test_coverage;
+  const issues = (reviewAgent?.output as any)?.issues ?? [];
+  const tests = (testAgent?.output as any)?.test_results ?? [];
+  const coverage = (testAgent?.output as any)?.coverage_percent;
 
-  const errorCount = issues.filter((i) => i.severity === 'error').length;
-  const warningCount = issues.filter((i) => i.severity === 'warning').length;
-  const passedTests = tests.filter((t) => t.status === 'passed').length;
-  const failedTests = tests.filter((t) => t.status === 'failed').length;
+  const errorCount = issues.filter((i: any) => i.severity === 'error').length;
+  const warningCount = issues.filter((i: any) => i.severity === 'warning').length;
+  const passedTests = tests.filter((t: any) => t.status === 'passed').length;
+  const failedTests = tests.filter((t: any) => t.status === 'failed').length;
 
   const handleSubmit = async (action: HITLDecision['action']) => {
     setSubmitting(true);
-    // Map frontend action names to backend HITLDecision enum values
+    setSubmitError(null);
     const decisionMap: Record<string, string> = {
       approve: 'approve',
       reject: 'reject',
       request_changes: 'modify',
     };
     try {
-      const res = await fetch(`/api/pipeline/${pipelineId}/approve`, {
+      const res = await authFetch(`/api/pipeline/${pipelineId}/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -61,7 +64,7 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
 
       onDecision({ action, comment: comment || undefined });
     } catch (err) {
-      console.error('HITL submission failed:', err);
+      setSubmitError(err instanceof Error ? err.message : 'Submission failed');
     } finally {
       setSubmitting(false);
     }
@@ -152,7 +155,7 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
             <div>
               <h3 className="text-sm font-semibold mb-2">Review Issues</h3>
               <ul className="space-y-1.5 max-h-40 overflow-y-auto">
-                {issues.map((issue, i) => (
+                {issues.map((issue: any, i: number) => (
                   <li
                     key={i}
                     className={`text-xs p-2.5 rounded-lg flex items-start gap-2 border ${
@@ -180,8 +183,8 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
               <h3 className="text-sm font-semibold mb-2">Failed Tests</h3>
               <ul className="space-y-1.5 max-h-32 overflow-y-auto">
                 {tests
-                  .filter((t) => t.status === 'failed')
-                  .map((test, i) => (
+                  .filter((t: any) => t.status === 'failed')
+                  .map((test: any, i: number) => (
                     <li
                       key={i}
                       className="text-xs p-2.5 rounded-lg bg-red-500/5 text-red-300 flex items-start gap-2 border border-red-500/10"
@@ -216,7 +219,11 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
         </div>
 
         {/* Actions */}
-        <div className="flex items-center justify-end gap-3 p-5 border-t border-forge-border">
+        <div className="flex items-center justify-between gap-3 p-5 border-t border-forge-border">
+          {submitError && (
+            <p className="text-xs text-red-400">{submitError}</p>
+          )}
+          <div className="flex items-center gap-3 ml-auto">
           <button
             onClick={() => handleSubmit('reject')}
             disabled={submitting}
@@ -241,6 +248,7 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
             <ShieldCheck className="w-4 h-4" />
             Approve
           </button>
+          </div>
         </div>
       </div>
     </div>

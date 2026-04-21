@@ -1,39 +1,48 @@
 """Codegen Agent — generates code and creates git branches."""
 
+from __future__ import annotations
+
 import json
 import os
 import re
+from typing import Any
 
 import structlog
 
 from agents.base import BaseAgent
-from models.schemas import AgentResult, RetryDecision
+from models.schemas import AgentResult, CodegenOutputError, RetryDecision
 from services.ollama_client import ollama_client
 
 logger = structlog.get_logger()
 
-SYSTEM_PROMPT = """You are an expert software engineer. Given a specification and file plan,
-generate the actual code for each file.
+SYSTEM_PROMPT = """You are an expert full-stack web developer. You build beautiful, production-quality web applications.
 
-IMPORTANT: Respond with ONLY a valid JSON object. No explanations, no thinking, no markdown.
+Your stack is ALWAYS:
+- Frontend: React (Vite) + Tailwind CSS — prioritize stunning, modern, polished UI/UX.
+- Backend: Node.js (Express) for APIs and server logic.
+- Database: Add SQLite, PostgreSQL, or MongoDB only when the app needs data persistence.
+- Services: Add Redis, WebSockets, etc. only when the app genuinely needs them.
+
+Given a specification and file plan, generate the actual code for each file.
 
 The JSON must have this exact structure:
 {
   "files": {
-    "path/to/file.py": "file content here...",
-    "path/to/another.py": "file content here..."
+    "path/to/file.jsx": "file content here...",
+    "path/to/server.js": "file content here..."
   },
   "branch": "feat/<descriptive-branch-name>",
   "commit_message": "feat: descriptive commit message"
 }
 
 Rules:
-- Write production-quality, well-structured code
-- Follow the language's conventions and best practices
-- Include proper error handling
-- Add docstrings/comments where needed
+- Write production-quality, well-structured code with beautiful UI
+- Always include ALL config files: package.json (with dev, build, start scripts), vite.config.js, tailwind.config.js, postcss.config.js, index.html, src/main.jsx, etc.
+- Make the UI visually impressive — use gradients, animations, proper spacing, modern design patterns
+- Include proper error handling and loading states
 - If previous review issues or test failures are provided, fix them
-- Output ONLY the JSON object — no ```json blocks, no thinking tags, no extra text"""
+- You may use thinking tags internally, but ensure the final output is clean JSON
+- Output ONLY the JSON object — no ```json blocks, no extra text"""
 
 
 def _extract_json(text: str) -> dict | None:
@@ -144,7 +153,7 @@ class CodegenAgent(BaseAgent):
         return "codegen"
 
     def get_model(self) -> str:
-        return os.getenv("MODEL_CODEGEN", "qwen3.5:397b-cloud")
+        return os.getenv("MODEL_CODEGEN", "qwen3-coder-next:cloud")
 
     async def validate(self, context: dict) -> bool:
         # Normal mode needs spec + file_plan; modification mode just needs existing_files + request
@@ -192,19 +201,21 @@ SPECIFICATION:
 FILE PLAN:
 {json.dumps(file_plan, indent=2)}
 """
-            if review_issues:
-                prompt += f"""
+
+        # Appended to both normal and diff-aware prompts when looping
+        if review_issues:
+            prompt += f"""
 PREVIOUS REVIEW ISSUES (fix these):
 {json.dumps(review_issues, indent=2)}
 """
-            if test_results:
-                failed = [t for t in test_results if t.get("status") == "failed"]
-                if failed:
-                    prompt += f"""
+        if test_results:
+            failed = [t for t in test_results if t.get("status") == "failed"]
+            if failed:
+                prompt += f"""
 FAILED TESTS (fix the code so these pass):
 {json.dumps(failed, indent=2)}
 """
-            prompt += '\nRespond with ONLY the JSON object. Start your response with {'
+        prompt += '\nRespond with ONLY the JSON object. Start your response with {'
 
         # Use smaller token budget on retries (fixing issues doesn't need full output)
         is_retry = bool(review_issues or test_results)
@@ -220,31 +231,29 @@ FAILED TESTS (fix the code so these pass):
         output = _extract_json(response_text)
 
         if output is None:
-            # Log parse error detail for debugging
+            parse_detail = ""
             try:
                 json.loads(response_text)
-            except json.JSONDecodeError as parse_err:
-                parse_detail = str(parse_err)[:200]
-            else:
-                parse_detail = "unknown"
-            logger.warning(
-                "codegen_json_parse_failed",
-                pipeline_id=context.get("pipeline_id"),
-                response_length=len(response_text),
-                response_start=response_text[:300],
-                response_end=response_text[-200:] if len(response_text) > 200 else "",
+            except json.JSONDecodeError as e:
+                parse_detail = str(e)[:200]
+            raise CodegenOutputError(
+                message="LLM output could not be parsed as JSON",
                 parse_error=parse_detail,
+                response_snippet=response_text[:500],
             )
-            output = {
-                "files": {},
-                "branch": f"feat/{context.get('pipeline_id', 'unknown')}",
-                "commit_message": "feat: generated code",
-            }
+
+        # Validate schema: files must be a dict.
+        files = output.get("files")
+        if not isinstance(files, dict):
+            raise CodegenOutputError(
+                message=f"LLM output 'files' field must be a dict, got {type(files).__name__}",
+                response_snippet=response_text[:500],
+            )
 
         return AgentResult(
-            success=bool(output.get("files")),
+            success=bool(files),
             output=output,
             tokens_used=result["tokens_used"],
             model_used=result["model"],
-            error="No files generated" if not output.get("files") else None,
+            error=None if files else "No files generated",
         )

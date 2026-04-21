@@ -1,8 +1,8 @@
 """CI/CD Agent — builds Docker images and deploys containers.
 
-Uses template-based Dockerfile generation instead of LLM-generated Dockerfiles.
-The LLM is only used for a deployment summary; the Dockerfile is deterministically
-built from scanning the actual generated code files.
+Forge always builds React (Vite) + Node.js (Express) apps.
+Uses template-based Dockerfile generation (not LLM-generated).
+The LLM is only used for a lightweight deployment summary.
 """
 
 import asyncio
@@ -21,62 +21,8 @@ from services.ollama_client import ollama_client
 logger = structlog.get_logger()
 
 # ---------------------------------------------------------------------------
-# Common import fixes for LLM-generated Python code
+# Port fixes for LLM-generated Node.js code
 # ---------------------------------------------------------------------------
-
-_FASTAPI_RESPONSE_CLASSES = {
-    "HTMLResponse", "JSONResponse", "PlainTextResponse", "RedirectResponse",
-    "StreamingResponse", "FileResponse", "Response",
-}
-
-
-def _fix_fastapi_imports(import_str: str) -> str:
-    """Move response classes from 'from fastapi import ...' to 'from fastapi.responses import ...'."""
-    parts = [p.strip() for p in import_str.split(",")]
-    fastapi_imports = []
-    response_imports = []
-    for p in parts:
-        if p in _FASTAPI_RESPONSE_CLASSES:
-            response_imports.append(p)
-        else:
-            fastapi_imports.append(p)
-    lines = []
-    if fastapi_imports:
-        lines.append(f"from fastapi import {', '.join(fastapi_imports)}")
-    if response_imports:
-        lines.append(f"from fastapi.responses import {', '.join(response_imports)}")
-    return "\n".join(lines) if lines else f"from fastapi import {import_str}"
-
-
-_IMPORT_FIXES = [
-    (r'from fastapi import (.+)', lambda m: _fix_fastapi_imports(m.group(1))),
-]
-
-
-def _auto_fix_python_files(context_path: str, target_port: str = "9000") -> list[str]:
-    """Apply common import fixes and port corrections to all Python files."""
-    fixed = []
-    for root, _dirs, filenames in os.walk(context_path):
-        for fname in filenames:
-            if not fname.endswith(".py"):
-                continue
-            fpath = os.path.join(root, fname)
-            with open(fpath, "r") as f:
-                content = f.read()
-            original = content
-            for pattern, replacer in _IMPORT_FIXES:
-                content = _re.sub(pattern, replacer, content)
-            content = _re.sub(
-                r'(uvicorn\.run\([^)]*port\s*=\s*)\d+', rf'\g<1>{target_port}', content
-            )
-            content = _re.sub(
-                r'(getenv\(\s*["\']PORT["\']\s*,\s*["\'])\d+(["\'])', rf'\g<1>{target_port}\2', content
-            )
-            if content != original:
-                with open(fpath, "w") as f:
-                    f.write(content)
-                fixed.append(os.path.relpath(fpath, context_path))
-    return fixed
 
 
 def _auto_fix_node_files(context_path: str, target_port: str = "9000") -> list[str]:
@@ -115,80 +61,8 @@ def _auto_fix_node_files(context_path: str, target_port: str = "9000") -> list[s
 
 
 # ---------------------------------------------------------------------------
-# Language Detection
+# Node.js Detection
 # ---------------------------------------------------------------------------
-
-def _detect_project_type(files: dict, context_path: str) -> str:
-    """Detect the project type from the generated files.
-
-    Returns one of: 'node', 'python', 'go', 'static', 'unknown'
-    """
-    filenames = set(files.keys())
-
-    # Also scan what's on disk (auto-generated files like package.json)
-    if os.path.exists(context_path):
-        for f in os.listdir(context_path):
-            filenames.add(f)
-
-    extensions = {os.path.splitext(f)[1].lower() for f in filenames}
-
-    # Check for explicit markers first
-    if "package.json" in filenames or "yarn.lock" in filenames:
-        return "node"
-    if "go.mod" in filenames or "go.sum" in filenames:
-        return "go"
-    if "requirements.txt" in filenames or "pyproject.toml" in filenames or "Pipfile" in filenames:
-        return "python"
-
-    # Check by file extensions
-    if extensions & {".jsx", ".tsx", ".ts"}:
-        return "node"
-    if extensions & {".go"}:
-        return "go"
-    if extensions & {".py"}:
-        return "python"
-    if extensions & {".js"}:
-        # Could be Node server or static — check for server patterns
-        for content in files.values():
-            if any(kw in content for kw in ["require(", "express", "http.createServer", "fastify", "koa"]):
-                return "node"
-        return "node"  # Default .js to node
-    if extensions & {".html", ".css"} and not (extensions & {".py", ".go", ".js"}):
-        return "static"
-
-    return "python"  # Default fallback
-
-
-def _detect_python_entrypoint(files: dict, context_path: str) -> str:
-    """Detect the Python application entrypoint."""
-    # Check for common patterns in order of priority
-    for candidate in ["app/main.py", "main.py", "app.py", "server.py", "src/main.py", "src/app.py"]:
-        if candidate in files:
-            content = files[candidate]
-            if "uvicorn" in content or "FastAPI" in content or "fastapi" in content:
-                # It's a FastAPI/uvicorn app
-                module = candidate.replace("/", ".").replace(".py", "")
-                # Find the app variable name
-                app_match = _re.search(r'(\w+)\s*=\s*FastAPI\(', content)
-                app_var = app_match.group(1) if app_match else "app"
-                return f"uvicorn {module}:{app_var} --host 0.0.0.0 --port $PORT"
-            if "Flask" in content or "flask" in content:
-                return f"python {candidate}"
-            if "django" in content.lower():
-                return f"python {candidate}"
-            # Generic python file
-            return f"python {candidate}"
-
-    # Check if it's a uvicorn project by scanning all files
-    for path, content in files.items():
-        if path.endswith(".py") and "FastAPI" in content:
-            module = path.replace("/", ".").replace(".py", "")
-            app_match = _re.search(r'(\w+)\s*=\s*FastAPI\(', content)
-            app_var = app_match.group(1) if app_match else "app"
-            return f"uvicorn {module}:{app_var} --host 0.0.0.0 --port $PORT"
-
-    return "python main.py"
-
 
 def _detect_node_entrypoint(files: dict, context_path: str) -> str:
     """Detect the Node.js entry point from package.json or file names."""
@@ -226,16 +100,7 @@ def _detect_node_entrypoint(files: dict, context_path: str) -> str:
     return "index.js"
 
 
-def _detect_go_entrypoint(files: dict) -> str:
-    """Detect Go build target."""
-    # Check for cmd/ directory structure
-    for path in files:
-        if path.startswith("cmd/"):
-            return "cmd"
-    # Check for main.go
-    if "main.go" in files:
-        return "root"
-    return "root"
+
 
 
 # ---------------------------------------------------------------------------
@@ -309,96 +174,201 @@ def _generate_fallback_html(files: dict, context_path: str, build_dir: str) -> N
         f.write(html)
 
 
-def _generate_dockerfile_python(files: dict, context_path: str, target_port: str) -> str:
-    """Generate a Dockerfile for Python projects."""
-    entrypoint = _detect_python_entrypoint(files, context_path)
 
-    # Detect if requirements.txt exists or will exist
-    has_requirements = "requirements.txt" in files or os.path.exists(
-        os.path.join(context_path, "requirements.txt")
-    )
+def _detect_monorepo_layout(files: dict, context_path: str) -> dict | None:
+    """Detect monorepo with separate client/server directories.
 
-    # Scan all Python files for common imports to install
-    common_packages = set()
-    for path, content in files.items():
-        if not path.endswith(".py"):
-            continue
-        # Detect commonly needed packages
-        if "fastapi" in content.lower() or "FastAPI" in content:
-            common_packages.update(["fastapi", "uvicorn[standard]"])
-        if "flask" in content.lower():
-            common_packages.add("flask")
-        if "httpx" in content:
-            common_packages.add("httpx")
-        if "requests" in content and "import requests" in content:
-            common_packages.add("requests")
-        if "sqlalchemy" in content.lower():
-            common_packages.add("sqlalchemy")
-        if "pydantic" in content:
-            common_packages.add("pydantic")
-        if "jinja2" in content.lower():
-            common_packages.add("jinja2")
-        if "aiofiles" in content:
-            common_packages.add("aiofiles")
-        if "python-multipart" in content or "UploadFile" in content:
-            common_packages.add("python-multipart")
-        if "cors" in content.lower() or "CORSMiddleware" in content:
-            common_packages.update(["fastapi", "uvicorn[standard]"])
-        if "redis" in content and "import redis" in content:
-            common_packages.add("redis")
-        if "celery" in content:
-            common_packages.add("celery")
-        if "jwt" in content:
-            common_packages.add("PyJWT")
-        if "bcrypt" in content:
-            common_packages.add("bcrypt")
-        if "passlib" in content:
-            common_packages.add("passlib[bcrypt]")
+    Returns a dict with 'client_dir', 'server_dir', 'client_pkg', 'server_pkg'
+    if a monorepo layout is found, or None otherwise.
+    """
+    client_dirs = ["client", "frontend", "web", "app"]
+    server_dirs = ["server", "backend", "api"]
+
+    found_client = None
+    found_server = None
+
+    for cdir in client_dirs:
+        pkg_key = f"{cdir}/package.json"
+        pkg_path = os.path.join(context_path, cdir, "package.json")
+        content = files.get(pkg_key, "")
+        if not content and os.path.exists(pkg_path):
+            try:
+                with open(pkg_path) as f:
+                    content = f.read()
+            except Exception:
+                continue
+        if content:
+            try:
+                pkg = json.loads(content)
+                all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                if any(k in all_deps for k in ["react", "vue", "svelte", "@angular/core", "vite", "next"]):
+                    found_client = {"dir": cdir, "pkg": pkg, "content": content}
+                    break
+            except Exception:
+                continue
+
+    for sdir in server_dirs:
+        pkg_key = f"{sdir}/package.json"
+        pkg_path = os.path.join(context_path, sdir, "package.json")
+        content = files.get(pkg_key, "")
+        if not content and os.path.exists(pkg_path):
+            try:
+                with open(pkg_path) as f:
+                    content = f.read()
+            except Exception:
+                continue
+        if content:
+            try:
+                found_server = {"dir": sdir, "pkg": json.loads(content), "content": content}
+                break
+            except Exception:
+                continue
+
+    if found_client:
+        return {
+            "client_dir": found_client["dir"],
+            "client_pkg": found_client["pkg"],
+            "server_dir": found_server["dir"] if found_server else None,
+            "server_pkg": found_server["pkg"] if found_server else None,
+        }
+    return None
+
+
+def _generate_dockerfile_monorepo(
+    files: dict, context_path: str, target_port: str, layout: dict,
+) -> str:
+    """Generate a Dockerfile for monorepo projects with separate client/server dirs."""
+    client_dir = layout["client_dir"]
+    server_dir = layout.get("server_dir")
+    client_pkg = layout["client_pkg"]
+    server_pkg = layout.get("server_pkg", {})
+
+    client_deps = {**client_pkg.get("dependencies", {}), **client_pkg.get("devDependencies", {})}
+    uses_vite = "vite" in client_deps
+    has_build = "build" in client_pkg.get("scripts", {})
+
+    if uses_vite:
+        build_dir = "dist"
+    else:
+        build_dir = "build"
+
+    # Detect server entrypoint
+    server_entry = None
+    if server_dir and server_pkg:
+        server_scripts = server_pkg.get("scripts", {})
+        main = server_pkg.get("main", "")
+        if main:
+            server_entry = main
+        elif "start" in server_scripts:
+            # Try to extract node command from start script
+            start_cmd = server_scripts["start"]
+            parts = start_cmd.split()
+            for i, p in enumerate(parts):
+                if p in ("node", "ts-node", "tsx", "nodemon") and i + 1 < len(parts):
+                    server_entry = parts[i + 1]
+                    break
+
+    # Generate a combined static + API server
+    server_js = f"""const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = process.env.PORT || {target_port};
+const STATIC_DIRS = ['{client_dir}/{build_dir}', '{client_dir}/dist', '{client_dir}/build', '{client_dir}/public', '{client_dir}'];
+
+let staticDir = '{client_dir}';
+for (const dir of STATIC_DIRS) {{
+    if (fs.existsSync(path.join(__dirname, dir, 'index.html'))) {{
+        staticDir = dir;
+        break;
+    }}
+}}
+
+const MIME = {{
+    '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
+    '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg',
+    '.gif': 'image/gif', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+    '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+    '.map': 'application/json',
+}};
+
+const server = http.createServer((req, res) => {{
+    if (req.url === '/health') {{
+        res.writeHead(200, {{'Content-Type': 'application/json'}});
+        return res.end(JSON.stringify({{healthy: true}}));
+    }}
+
+    let filePath = path.join(__dirname, staticDir, req.url === '/' ? 'index.html' : req.url);
+
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {{
+        const withIndex = path.join(filePath, 'index.html');
+        if (fs.existsSync(withIndex)) {{
+            filePath = withIndex;
+        }} else {{
+            filePath = path.join(__dirname, staticDir, 'index.html');
+        }}
+    }}
+
+    if (!fs.existsSync(filePath)) {{
+        res.writeHead(404);
+        return res.end('Not Found');
+    }}
+
+    const ext = path.extname(filePath);
+    const mime = MIME[ext] || 'application/octet-stream';
+    res.writeHead(200, {{'Content-Type': mime}});
+    fs.createReadStream(filePath).pipe(res);
+}});
+
+server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port ${{PORT}}`));
+"""
+
+    server_path = os.path.join(context_path, "_static_server.cjs")
+    with open(server_path, "w") as f:
+        f.write(server_js)
+
+    # Generate fallback index.html for the client dir
+    client_files = {k: v for k, v in files.items() if k.startswith(f"{client_dir}/")}
+    _generate_fallback_html(client_files, os.path.join(context_path, client_dir), build_dir)
 
     lines = [
-        "FROM python:3.12-slim",
+        "FROM node:20-alpine",
         "WORKDIR /app",
         "",
-        "# Install system dependencies for common Python packages",
-        "RUN apt-get update && apt-get install -y --no-install-recommends \\",
-        "    gcc libpq-dev curl && \\",
-        "    rm -rf /var/lib/apt/lists/*",
-        "",
-    ]
-
-    # Install detected packages first (they're always correct)
-    if common_packages:
-        pkg_list = " ".join(sorted(common_packages))
-        lines.append(f"# Install detected dependencies")
-        lines.append(f"RUN pip install --no-cache-dir {pkg_list}")
-        lines.append("")
-
-    # Then try requirements.txt (may have extra deps)
-    if has_requirements:
-        lines.append("# Install project requirements (if present)")
-        lines.append("COPY requirements.txt* ./")
-        lines.append("RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi")
-        lines.append("")
-
-    lines.extend([
-        "# Copy application code",
+        "# Copy all source files",
         "COPY . .",
         "",
+        f"# Install client dependencies and build frontend",
+        f"WORKDIR /app/{client_dir}",
+        "RUN npm install || true",
+    ]
+
+    if has_build:
+        fallback_target = f"{build_dir}/index.html"
+        lines.extend([
+            f"RUN npm run build || (mkdir -p {build_dir} && cp fallback_index.html {build_dir}/index.html 2>/dev/null && echo 'Build failed — using fallback')",
+        ])
+
+    if server_dir:
+        lines.extend([
+            "",
+            f"# Install server dependencies",
+            f"WORKDIR /app/{server_dir}",
+            "RUN npm install || true",
+        ])
+
+    lines.extend([
+        "",
+        "WORKDIR /app",
         f"ENV PORT={target_port}",
+        "ENV NODE_ENV=production",
         f"EXPOSE {target_port}",
         "",
-        "# Health check",
-        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD curl -f http://localhost:{target_port}/health || curl -f http://localhost:{target_port}/ || exit 1',
+        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://localhost:{target_port}/health || exit 1',
         "",
+        "# Serve the built frontend (with SPA routing + health checks)",
+        'CMD ["node", "_static_server.cjs"]',
     ])
-
-    # Determine CMD
-    if "uvicorn" in entrypoint:
-        # Replace $PORT with the actual port for the CMD
-        cmd = entrypoint.replace("$PORT", target_port)
-        lines.append(f'CMD ["/bin/sh", "-c", "{cmd}"]')
-    else:
-        lines.append(f'CMD ["/bin/sh", "-c", "{entrypoint}"]')
 
     return "\n".join(lines)
 
@@ -406,6 +376,13 @@ def _generate_dockerfile_python(files: dict, context_path: str, target_port: str
 def _generate_dockerfile_node(files: dict, context_path: str, target_port: str) -> str:
     """Generate a Dockerfile for Node.js projects."""
     entry = _detect_node_entrypoint(files, context_path)
+
+    # ---------------------------------------------------------------
+    # Check for monorepo layout (client/ + server/ subdirectories)
+    # ---------------------------------------------------------------
+    monorepo = _detect_monorepo_layout(files, context_path)
+    if monorepo:
+        return _generate_dockerfile_monorepo(files, context_path, target_port, monorepo)
 
     # Read package.json
     pkg_content = files.get("package.json", "")
@@ -450,7 +427,7 @@ def _generate_dockerfile_node(files: dict, context_path: str, target_port: str) 
         "",
         "# Install dependencies first (better layer caching)",
         "COPY package*.json ./",
-        "RUN npm install",
+        "RUN npm install --workspaces || true",
         "",
         "# Copy application code",
         "COPY . .",
@@ -562,7 +539,7 @@ server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port
         "",
         "# Install ALL dependencies (including devDeps for build tools)",
         "COPY package*.json ./",
-        "RUN npm install",
+        "RUN npm install --workspaces || true",
         "",
         "# Copy application code",
         "COPY . .",
@@ -595,68 +572,9 @@ server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port
     return "\n".join(lines)
 
 
-def _generate_dockerfile_go(files: dict, context_path: str, target_port: str) -> str:
-    """Generate a Dockerfile for Go projects."""
-    go_entry = _detect_go_entrypoint(files)
-
-    lines = [
-        "FROM golang:1.22-alpine AS builder",
-        "WORKDIR /app",
-        "",
-        "# Copy go module files first for caching",
-        "COPY go.mod go.sum* ./",
-        "RUN go mod download 2>/dev/null || true",
-        "",
-        "# Copy source and build",
-        "COPY . .",
-    ]
-
-    if go_entry == "cmd":
-        lines.append("RUN CGO_ENABLED=0 GOOS=linux go build -o /app/main ./cmd/... || CGO_ENABLED=0 GOOS=linux go build -o /app/main .")
-    else:
-        lines.append("RUN CGO_ENABLED=0 GOOS=linux go build -o /app/main . || CGO_ENABLED=0 GOOS=linux go build -o /app/main ./cmd/...")
-
-    lines.extend([
-        "",
-        "# Minimal runtime image",
-        "FROM alpine:3.19",
-        "RUN apk --no-cache add ca-certificates curl",
-        "WORKDIR /app",
-        "COPY --from=builder /app/main .",
-        "",
-        f"ENV PORT={target_port}",
-        f"EXPOSE {target_port}",
-        "",
-        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD curl -f http://localhost:{target_port}/health || curl -f http://localhost:{target_port}/ || exit 1',
-        "",
-        'CMD ["./main"]',
-    ])
-
-    return "\n".join(lines)
-
-
-def _generate_dockerfile_static(files: dict, context_path: str, target_port: str) -> str:
-    """Generate a Dockerfile for static HTML/CSS/JS sites."""
-    return f"""FROM node:20-alpine
-WORKDIR /app
-RUN npm install -g serve
-COPY . .
-ENV PORT={target_port}
-EXPOSE {target_port}
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://localhost:{target_port}/ || exit 1
-CMD ["serve", "-s", ".", "-l", "{target_port}"]"""
-
-
-def _generate_dockerfile(project_type: str, files: dict, context_path: str, target_port: str) -> str:
-    """Generate the right Dockerfile based on detected project type."""
-    generators = {
-        "python": _generate_dockerfile_python,
-        "node": _generate_dockerfile_node,
-        "go": _generate_dockerfile_go,
-        "static": _generate_dockerfile_static,
-    }
-    generator = generators.get(project_type, _generate_dockerfile_python)
-    return generator(files, context_path, target_port)
+def _generate_dockerfile(files: dict, context_path: str, target_port: str) -> str:
+    """Generate a Dockerfile for React (Vite) + Node.js (Express) apps."""
+    return _generate_dockerfile_node(files, context_path, target_port)
 
 
 # ---------------------------------------------------------------------------
@@ -735,92 +653,7 @@ def _ensure_package_json(files: dict, context_path: str, target_port: str) -> bo
     return True
 
 
-def _ensure_requirements_txt(files: dict, context_path: str) -> bool:
-    """Auto-generate requirements.txt if missing for Python projects."""
-    req_path = os.path.join(context_path, "requirements.txt")
-    if os.path.exists(req_path):
-        return False
 
-    # Scan for import statements
-    imports = set()
-    for root, _dirs, fnames in os.walk(context_path):
-        for fn in fnames:
-            if not fn.endswith(".py"):
-                continue
-            try:
-                with open(os.path.join(root, fn)) as f:
-                    src = f.read()
-                for match in _re.findall(r"^(?:from|import)\s+(\w+)", src, _re.MULTILINE):
-                    imports.add(match)
-            except Exception:
-                pass
-
-    # Map import names to pip package names (only third-party)
-    stdlib = {
-        "os", "sys", "json", "re", "math", "datetime", "time", "random",
-        "hashlib", "pathlib", "typing", "asyncio", "collections", "functools",
-        "itertools", "logging", "io", "uuid", "copy", "dataclasses", "abc",
-        "enum", "contextlib", "unittest", "http", "urllib", "socket",
-        "threading", "subprocess", "shutil", "tempfile", "glob", "csv",
-        "sqlite3", "html", "xml", "email", "base64", "struct", "ctypes",
-    }
-    import_to_pip = {
-        "fastapi": "fastapi",
-        "uvicorn": "uvicorn[standard]",
-        "flask": "flask",
-        "httpx": "httpx",
-        "requests": "requests",
-        "sqlalchemy": "sqlalchemy",
-        "pydantic": "pydantic",
-        "jinja2": "jinja2",
-        "aiofiles": "aiofiles",
-        "redis": "redis",
-        "celery": "celery",
-        "jwt": "PyJWT",
-        "bcrypt": "bcrypt",
-        "passlib": "passlib[bcrypt]",
-        "dotenv": "python-dotenv",
-        "PIL": "Pillow",
-        "cv2": "opencv-python",
-        "numpy": "numpy",
-        "pandas": "pandas",
-        "matplotlib": "matplotlib",
-        "sklearn": "scikit-learn",
-        "boto3": "boto3",
-        "starlette": "starlette",
-        "websockets": "websockets",
-        "psycopg2": "psycopg2-binary",
-        "motor": "motor",
-        "pymongo": "pymongo",
-    }
-
-    requirements = []
-    for imp in sorted(imports):
-        if imp in stdlib:
-            continue
-        pip_name = import_to_pip.get(imp, imp)
-        if imp not in stdlib:
-            requirements.append(pip_name)
-
-    if requirements:
-        with open(req_path, "w") as f:
-            f.write("\n".join(requirements) + "\n")
-        logger.info("auto_generated_requirements_txt", packages=requirements)
-        return True
-    return False
-
-
-def _ensure_go_mod(files: dict, context_path: str) -> bool:
-    """Auto-generate go.mod if missing for Go projects."""
-    mod_path = os.path.join(context_path, "go.mod")
-    if os.path.exists(mod_path):
-        return False
-
-    with open(mod_path, "w") as f:
-        f.write("module forge-app\n\ngo 1.22\n")
-
-    logger.info("auto_generated_go_mod")
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -837,7 +670,8 @@ Produce a JSON response with:
   "env_vars": {}
 }
 
-Always respond with valid JSON only."""
+You may reason internally, but your final output must be valid JSON only.
+Do NOT wrap the JSON in markdown code fences."""
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +685,7 @@ class CICDAgent(BaseAgent):
         return "cicd"
 
     def get_model(self) -> str:
-        return os.getenv("MODEL_CICD", "devstral-small-2:24b-cloud")
+        return os.getenv("MODEL_CICD", "qwen3.5:397b-cloud")
 
     async def validate(self, context: dict) -> bool:
         return bool(context.get("generated_files") or context.get("git_branch"))
@@ -880,26 +714,15 @@ class CICDAgent(BaseAgent):
             with open(full_path, "w") as f:
                 f.write(fcontent)
 
-        # Detect project type from the actual files
-        project_type = _detect_project_type(files, context_path)
-        logger.info("detected_project_type", pipeline_id=pipeline_id, project_type=project_type)
-
-        # Auto-generate missing dependency files
-        if project_type == "node":
-            _ensure_package_json(files, context_path, target_port)
-            fixed = _auto_fix_node_files(context_path, target_port)
-            if fixed:
-                logger.info("auto_fixed_node_ports", pipeline_id=pipeline_id, files=fixed)
-        elif project_type == "python":
-            _ensure_requirements_txt(files, context_path)
-            fixed = _auto_fix_python_files(context_path, target_port)
-            if fixed:
-                logger.info("auto_fixed_python", pipeline_id=pipeline_id, files=fixed)
-        elif project_type == "go":
-            _ensure_go_mod(files, context_path)
+        # Auto-generate missing dependency files and fix ports
+        _ensure_package_json(files, context_path, target_port)
+        fixed = _auto_fix_node_files(context_path, target_port)
+        if fixed:
+            logger.info("auto_fixed_node_ports", pipeline_id=pipeline_id, files=fixed)
 
         # Generate Dockerfile from template (NOT from LLM)
-        dockerfile_content = _generate_dockerfile(project_type, files, context_path, target_port)
+        project_type = "node"
+        dockerfile_content = _generate_dockerfile(files, context_path, target_port)
         with open(os.path.join(context_path, "Dockerfile"), "w") as f:
             f.write(dockerfile_content)
         logger.info("template_dockerfile_generated", pipeline_id=pipeline_id, project_type=project_type)
@@ -971,11 +794,17 @@ class CICDAgent(BaseAgent):
                 continue
 
             # If deploy succeeded, verify the container is healthy
+            # Poll multiple times with increasing delay — LLM-generated apps
+            # may need time for npm install, compilation, etc.
             if docker_error is None:
-                await asyncio.sleep(5)
                 deploy_url = deploy_data.get("url", "")
                 verify_url = deploy_url.replace("localhost", "host.docker.internal") if deploy_url else ""
-                container_ok = await self._verify_container(docker_svc_url, f"forge-{pipeline_id}", verify_url)
+                container_ok = False
+                for health_check in range(6):
+                    await asyncio.sleep(5 + health_check * 3)
+                    container_ok = await self._verify_container(docker_svc_url, f"forge-{pipeline_id}", verify_url)
+                    if container_ok:
+                        break
                 if not container_ok and attempt < max_attempts:
                     logger.warning("container_unhealthy_retrying", pipeline_id=pipeline_id, attempt=attempt)
                     try:
@@ -1014,6 +843,14 @@ class CICDAgent(BaseAgent):
             df = f.read()
 
         error_lower = error.lower()
+
+        # Fix: npm install failures (missing deps, optional deps, etc.)
+        df = _re.sub(
+            r'(^RUN\s+npm\s+install.*)$',
+            r'\1 || true',
+            df,
+            flags=_re.MULTILINE,
+        )
 
         # Fix: COPY failed for missing files
         if "copy failed" in error_lower or "file not found" in error_lower:

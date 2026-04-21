@@ -20,8 +20,10 @@ produce a structured specification in JSON format with these fields:
   "estimated_complexity": "low|medium|high"
 }
 
-Be thorough but concise. Focus on what the software should DO, not how to implement it.
-Always respond with valid JSON only, no markdown or explanation."""
+Be thorough but concise. Focus on what the software should DO.
+If the request is a web application, assume it will be built with modern React (Vite) and Node.js.
+You may use <think> tags for reasoning, but your final answer must be valid JSON only.
+No markdown code fences, no explanations outside of <think> tags."""
 
 
 class RequirementsAgent(BaseAgent):
@@ -31,7 +33,7 @@ class RequirementsAgent(BaseAgent):
         return "requirements"
 
     def get_model(self) -> str:
-        return os.getenv("MODEL_REQUIREMENTS", "llama3:8b")
+        return os.getenv("MODEL_REQUIREMENTS", "deepseek-v3.2:cloud")
 
     async def validate(self, context: dict) -> bool:
         return bool(context.get("input_text"))

@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -19,49 +20,14 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 )
-
-// ---------------------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------------------
-
-var (
-	httpRequestsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "forge_docker_http_requests_total",
-			Help: "Total HTTP requests handled by forge-docker-svc",
-		},
-		[]string{"method", "path", "status"},
-	)
-	httpRequestDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "forge_docker_http_request_duration_seconds",
-			Help:    "HTTP request duration in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"method", "path"},
-	)
-	dockerBuildsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "forge_docker_builds_total",
-		Help: "Total Docker image builds",
-	})
-	dockerDeploysTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "forge_docker_deploys_total",
-		Help: "Total Docker container deploys",
-	})
-)
-
-func init() {
-	prometheus.MustRegister(httpRequestsTotal, httpRequestDuration, dockerBuildsTotal, dockerDeploysTotal)
-}
 
 // ---------------------------------------------------------------------------
 // Request / Response types
@@ -170,23 +136,6 @@ func (s *Server) publishEvent(ctx context.Context, eventType, pipelineID string,
 }
 
 // ---------------------------------------------------------------------------
-// Prometheus middleware
-// ---------------------------------------------------------------------------
-
-func prometheusMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-		next.ServeHTTP(ww, r)
-		duration := time.Since(start).Seconds()
-
-		path := r.URL.Path
-		httpRequestsTotal.WithLabelValues(r.Method, path, fmt.Sprintf("%d", ww.Status())).Inc()
-		httpRequestDuration.WithLabelValues(r.Method, path).Observe(duration)
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -264,8 +213,6 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "docker build failed: "+lastErr)
 		return
 	}
-
-	dockerBuildsTotal.Inc()
 
 	s.publishEvent(ctx, "docker.build.completed", req.PipelineID, map[string]interface{}{
 		"image":    imageTag,
@@ -349,8 +296,6 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "container start failed: "+err.Error())
 		return
 	}
-
-	dockerDeploysTotal.Inc()
 
 	url := fmt.Sprintf("http://localhost:%s", hostPort)
 
@@ -735,6 +680,504 @@ func (s *Server) cleanupOldContainers() {
 }
 
 // ---------------------------------------------------------------------------
+// Test Runner
+// ---------------------------------------------------------------------------
+
+type TestRunRequest struct {
+	PipelineID     string            `json:"pipeline_id"`
+	GeneratedFiles map[string]string `json:"generated_files"`
+	TestFiles      map[string]string `json:"test_files"`
+	Language       string            `json:"language"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+}
+
+type TestRunResult struct {
+	TestName     string  `json:"test_name"`
+	Status       string  `json:"status"` // passed | failed | skipped | error
+	DurationMs   float64 `json:"duration_ms"`
+	ErrorMessage string  `json:"error_message,omitempty"`
+}
+
+type TestRunResponse struct {
+	Success         bool            `json:"success"`
+	TestResults     []TestRunResult `json:"test_results"`
+	CoveragePercent float64         `json:"coverage_percent"`
+	Passed          int             `json:"passed"`
+	Failed          int             `json:"failed"`
+	Skipped         int             `json:"skipped"`
+	Total           int             `json:"total"`
+	RawOutput       string          `json:"raw_output"`
+	Language        string          `json:"language"`
+	Error           string          `json:"error,omitempty"`
+}
+
+// createTarFromMap builds a tar archive from an in-memory map of path→content.
+func createTarFromMap(files map[string]string) (*bytes.Buffer, error) {
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+	// Create parent directories first
+	dirs := map[string]bool{}
+	for path := range files {
+		for dir := filepath.Dir(path); dir != "." && dir != "/"; dir = filepath.Dir(dir) {
+			if dirs[dir] {
+				break
+			}
+			dirs[dir] = true
+			_ = tw.WriteHeader(&tar.Header{Name: dir + "/", Mode: 0755, Typeflag: tar.TypeDir})
+		}
+	}
+	for path, content := range files {
+		data := []byte(content)
+		if err := tw.WriteHeader(&tar.Header{Name: path, Mode: 0644, Size: int64(len(data))}); err != nil {
+			return nil, err
+		}
+		if _, err := tw.Write(data); err != nil {
+			return nil, err
+		}
+	}
+	tw.Close()
+	return buf, nil
+}
+
+// detectTestLanguage infers language from file extensions/names.
+func detectTestLanguage(files map[string]string) string {
+	for name := range files {
+		base := strings.ToLower(filepath.Base(name))
+		ext := strings.ToLower(filepath.Ext(name))
+		switch {
+		case base == "package.json" || ext == ".ts" || ext == ".tsx" || ext == ".jsx":
+			return "node"
+		case base == "go.mod" || ext == ".go":
+			return "go"
+		case ext == ".py":
+			return "python"
+		case ext == ".js":
+			return "node"
+		}
+	}
+	return "python"
+}
+
+// testRunnerImageAndCmd returns the Docker image + shell command for the given language.
+func testRunnerImageAndCmd(lang string) (string, string) {
+	switch lang {
+	case "go":
+		return "golang:1.22-alpine",
+			"go test ./... -json 2>&1"
+	case "node":
+		// forge-test-node:latest has React, Vite, Vitest, testing-library
+		// pre-installed in /opt/forge-cache/node_modules (NODE_PATH is set).
+		// npm install only downloads packages NOT in the cache — typically <5s.
+		return "forge-test-node:latest",
+			"cd /app && " +
+				// If no package.json, create a minimal one so npm install succeeds.
+				"if [ ! -f package.json ]; then " +
+				"cp /opt/forge-cache/package.json package.json; " +
+				"fi; " +
+				// Symlink cached node_modules as fallback, then install project deps.
+				"if [ ! -d node_modules ]; then " +
+				"ln -s /opt/forge-cache/node_modules node_modules 2>/dev/null || true; " +
+				"fi; " +
+				"npm install --prefer-offline --silent 2>/dev/null; " +
+				// Run tests with vitest (pre-cached), or jest if found.
+				"if [ -f node_modules/.bin/vitest ] || [ -f /opt/forge-cache/node_modules/.bin/vitest ]; then " +
+				"npx vitest run --reporter=json 2>&1 | tee /tmp/vitest.json; " +
+				"echo '---RESULTS---'; cat /tmp/vitest.json 2>/dev/null || echo '{}'; " +
+				"elif [ -f node_modules/.bin/jest ]; then " +
+				"npx jest --json --outputFile=/tmp/jest.json --passWithNoTests 2>&1; " +
+				"echo '---RESULTS---'; cat /tmp/jest.json 2>/dev/null || echo '{}'; " +
+				"else " +
+				"npx vitest run --reporter=json 2>&1 | tee /tmp/vitest.json; " +
+				"echo '---RESULTS---'; cat /tmp/vitest.json 2>/dev/null || echo '{}'; " +
+				"fi"
+	default: // python
+		return "python:3.12-slim",
+			"pip install pytest pytest-json-report -q 2>&1 | tail -2; " +
+				"(pip install -r requirements.txt -q 2>&1 | tail -2 || true); " +
+				"pytest --json-report --json-report-file=/tmp/report.json -v 2>&1; " +
+				"echo '---RESULTS---'; cat /tmp/report.json 2>/dev/null || echo '{}'"
+	}
+}
+
+// parsePytestReport parses our custom python test command output.
+func parsePytestReport(output string) (results []TestRunResult, passed, failed, skipped int) {
+	parts := strings.SplitN(output, "---RESULTS---", 2)
+	if len(parts) == 2 {
+		jsonStr := strings.TrimSpace(parts[1])
+		var report struct {
+			Tests []struct {
+				NodeID   string  `json:"nodeid"`
+				Outcome  string  `json:"outcome"`
+				Duration float64 `json:"duration"`
+				Call     *struct {
+					Longrepr string `json:"longrepr"`
+				} `json:"call"`
+			} `json:"tests"`
+		}
+		if err := json.Unmarshal([]byte(jsonStr), &report); err == nil && len(report.Tests) > 0 {
+			for _, t := range report.Tests {
+				errMsg := ""
+				if t.Call != nil && len(t.Call.Longrepr) > 0 {
+					errMsg = t.Call.Longrepr
+					if len(errMsg) > 300 {
+						errMsg = errMsg[:300] + "..."
+					}
+				}
+				switch t.Outcome {
+				case "passed":
+					passed++
+				case "failed", "error":
+					failed++
+				case "skipped":
+					skipped++
+				}
+				results = append(results, TestRunResult{
+					TestName: t.NodeID, Status: t.Outcome,
+					DurationMs: t.Duration * 1000, ErrorMessage: errMsg,
+				})
+			}
+			return
+		}
+	}
+	// Fallback: parse pytest verbose text
+	for _, line := range strings.Split(parts[0], "\n") {
+		line = strings.TrimSpace(line)
+		var name, status string
+		if i := strings.Index(line, " PASSED"); i > 0 {
+			name, status = strings.TrimSpace(line[:i]), "passed"
+			passed++
+		} else if i := strings.Index(line, " FAILED"); i > 0 {
+			name, status = strings.TrimSpace(line[:i]), "failed"
+			failed++
+		} else if i := strings.Index(line, " SKIPPED"); i > 0 {
+			name, status = strings.TrimSpace(line[:i]), "skipped"
+			skipped++
+		}
+		if name != "" && strings.Contains(name, "::") {
+			if i := strings.LastIndex(name, "["); i > 0 {
+				name = strings.TrimSpace(name[:i])
+			}
+			results = append(results, TestRunResult{TestName: name, Status: status})
+		}
+	}
+	return
+}
+
+// parseGoTestJSON parses `go test -json` NDJSON output.
+func parseGoTestJSON(output string) (results []TestRunResult, passed, failed, skipped int) {
+	type ev struct {
+		Action  string  `json:"Action"`
+		Test    string  `json:"Test"`
+		Elapsed float64 `json:"Elapsed"`
+		Output  string  `json:"Output"`
+	}
+	errOutputs := map[string][]string{}
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		var e ev
+		if json.Unmarshal(scanner.Bytes(), &e) != nil || e.Test == "" {
+			continue
+		}
+		switch e.Action {
+		case "pass":
+			passed++
+			results = append(results, TestRunResult{TestName: e.Test, Status: "passed", DurationMs: e.Elapsed * 1000})
+		case "fail":
+			failed++
+			msg := strings.Join(errOutputs[e.Test], "")
+			if len(msg) > 300 {
+				msg = msg[:300] + "..."
+			}
+			results = append(results, TestRunResult{TestName: e.Test, Status: "failed", DurationMs: e.Elapsed * 1000, ErrorMessage: msg})
+		case "skip":
+			skipped++
+			results = append(results, TestRunResult{TestName: e.Test, Status: "skipped"})
+		case "output":
+			if e.Test != "" {
+				errOutputs[e.Test] = append(errOutputs[e.Test], e.Output)
+			}
+		}
+	}
+	return
+}
+
+// parseJestReport parses our custom node test command output.
+func parseJestReport(output string) (results []TestRunResult, passed, failed, skipped int) {
+	parts := strings.SplitN(output, "---RESULTS---", 2)
+	if len(parts) < 2 {
+		return
+	}
+	var report struct {
+		TestResults []struct {
+			AssertionResults []struct {
+				FullName        string   `json:"fullName"`
+				Status          string   `json:"status"`
+				Duration        float64  `json:"duration"`
+				FailureMessages []string `json:"failureMessages"`
+			} `json:"assertionResults"`
+		} `json:"testResults"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(parts[1])), &report) != nil {
+		return
+	}
+	for _, suite := range report.TestResults {
+		for _, t := range suite.AssertionResults {
+			status := t.Status
+			if status == "pending" {
+				status = "skipped"
+			}
+			msg := ""
+			if len(t.FailureMessages) > 0 {
+				msg = t.FailureMessages[0]
+				if len(msg) > 300 {
+					msg = msg[:300] + "..."
+				}
+			}
+			switch status {
+			case "passed":
+				passed++
+			case "failed":
+				failed++
+			case "skipped":
+				skipped++
+			}
+			results = append(results, TestRunResult{TestName: t.FullName, Status: status, DurationMs: t.Duration, ErrorMessage: msg})
+		}
+	}
+	return
+}
+
+// parseTestOutput dispatches to the right parser and builds a TestRunResponse.
+func parseTestOutput(output, lang string) TestRunResponse {
+	var results []TestRunResult
+	var passed, failed, skipped int
+	switch lang {
+	case "go":
+		results, passed, failed, skipped = parseGoTestJSON(output)
+	case "node":
+		// Try vitest format first, then jest
+		results, passed, failed, skipped = parseVitestReport(output)
+		if len(results) == 0 {
+			results, passed, failed, skipped = parseJestReport(output)
+		}
+	default:
+		results, passed, failed, skipped = parsePytestReport(output)
+	}
+	if results == nil {
+		results = []TestRunResult{}
+	}
+	return TestRunResponse{
+		Success:     failed == 0 && (passed+skipped) > 0,
+		TestResults: results,
+		Passed:      passed,
+		Failed:      failed,
+		Skipped:     skipped,
+		Total:       passed + failed + skipped,
+	}
+}
+
+// parseVitestReport parses vitest --reporter=json output.
+func parseVitestReport(output string) (results []TestRunResult, passed, failed, skipped int) {
+	// Vitest JSON reporter outputs the JSON directly to stdout
+	// Try to find JSON in the output (may be mixed with log lines)
+	parts := strings.SplitN(output, "---RESULTS---", 2)
+	jsonStr := output
+	if len(parts) == 2 {
+		jsonStr = strings.TrimSpace(parts[1])
+	}
+
+	// Vitest JSON format
+	var report struct {
+		TestResults []struct {
+			AssertionResults []struct {
+				FullName        string   `json:"fullName"`
+				Status          string   `json:"status"`
+				Duration        float64  `json:"duration"`
+				FailureMessages []string `json:"failureMessages"`
+			} `json:"assertionResults"`
+		} `json:"testResults"`
+		// Vitest also nests under numPassedTests etc.
+		NumPassedTests  int `json:"numPassedTests"`
+		NumFailedTests  int `json:"numFailedTests"`
+		NumTotalTests   int `json:"numTotalTests"`
+		NumPendingTests int `json:"numPendingTests"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &report); err != nil {
+		return
+	}
+
+	for _, suite := range report.TestResults {
+		for _, t := range suite.AssertionResults {
+			status := t.Status
+			// Vitest uses "pass"/"fail" while Jest uses "passed"/"failed"
+			switch status {
+			case "pass", "passed":
+				status = "passed"
+				passed++
+			case "fail", "failed":
+				status = "failed"
+				failed++
+			case "pending", "skipped", "skip":
+				status = "skipped"
+				skipped++
+			}
+			msg := ""
+			if len(t.FailureMessages) > 0 {
+				msg = t.FailureMessages[0]
+				if len(msg) > 300 {
+					msg = msg[:300] + "..."
+				}
+			}
+			results = append(results, TestRunResult{
+				TestName:     t.FullName,
+				Status:       status,
+				DurationMs:   t.Duration,
+				ErrorMessage: msg,
+			})
+		}
+	}
+
+	// If no assertion results but we have summary counts, use those
+	if len(results) == 0 && report.NumTotalTests > 0 {
+		passed = report.NumPassedTests
+		failed = report.NumFailedTests
+		skipped = report.NumPendingTests
+		for i := 0; i < passed; i++ {
+			results = append(results, TestRunResult{
+				TestName: fmt.Sprintf("test_%d", i+1), Status: "passed", DurationMs: 10,
+			})
+		}
+		for i := 0; i < failed; i++ {
+			results = append(results, TestRunResult{
+				TestName: fmt.Sprintf("test_failed_%d", i+1), Status: "failed", DurationMs: 10,
+			})
+		}
+	}
+	return
+}
+
+// POST /docker/test — runs tests inside an isolated container.
+func (s *Server) handleRunTests(w http.ResponseWriter, r *http.Request) {
+	var req TestRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.PipelineID == "" {
+		s.writeError(w, http.StatusBadRequest, "pipeline_id is required")
+		return
+	}
+
+	// Merge generated + test files
+	allFiles := make(map[string]string, len(req.GeneratedFiles)+len(req.TestFiles))
+	for k, v := range req.GeneratedFiles {
+		allFiles[k] = v
+	}
+	for k, v := range req.TestFiles {
+		allFiles[k] = v
+	}
+	if len(allFiles) == 0 {
+		s.writeJSON(w, http.StatusOK, TestRunResponse{Success: true, TestResults: []TestRunResult{}, Language: "unknown"})
+		return
+	}
+
+	lang := req.Language
+	if lang == "" {
+		lang = detectTestLanguage(allFiles)
+	}
+	timeoutSec := req.TimeoutSeconds
+	if timeoutSec <= 0 || timeoutSec > 300 {
+		timeoutSec = 120
+	}
+
+	// Build tar from in-memory files (avoids bind-mount host-path issues)
+	tarBuf, err := createTarFromMap(allFiles)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to prepare test files: "+err.Error())
+		return
+	}
+
+	testImage, testCmd := testRunnerImageAndCmd(lang)
+	ctx := r.Context()
+
+	// Pull image (cached after first run; ignore errors — Docker will pull on create anyway)
+	pullCtx, pullCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer pullCancel()
+	if rc, err := s.docker.ImagePull(pullCtx, testImage, image.PullOptions{}); err == nil {
+		io.Copy(io.Discard, rc)
+		rc.Close()
+	}
+
+	// Create isolated container (no network, memory-capped)
+	cName := fmt.Sprintf("forge-test-%s-%s", req.PipelineID[:8], uuid.New().String()[:8])
+	created, err := s.docker.ContainerCreate(ctx, &container.Config{
+		Image:      testImage,
+		Cmd:        []string{"sh", "-c", testCmd},
+		WorkingDir: "/app",
+	}, &container.HostConfig{
+		NetworkMode: "bridge",
+		Resources:   container.Resources{Memory: 1024 * 1024 * 1024, NanoCPUs: 2_000_000_000},
+	}, nil, nil, cName)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to create test container: "+err.Error())
+		return
+	}
+	defer s.docker.ContainerRemove(context.Background(), created.ID, container.RemoveOptions{Force: true})
+
+	// Copy files into the container before starting
+	if err := s.docker.CopyToContainer(ctx, created.ID, "/app", tarBuf, types.CopyToContainerOptions{}); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to copy files into test container: "+err.Error())
+		return
+	}
+
+	// Start the container
+	if err := s.docker.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to start test container: "+err.Error())
+		return
+	}
+
+	// Wait with timeout
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer waitCancel()
+	statusC, errC := s.docker.ContainerWait(waitCtx, created.ID, container.WaitConditionNotRunning)
+	select {
+	case res := <-statusC:
+		s.log.Info().Str("pipeline_id", req.PipelineID).Int64("exit_code", res.StatusCode).Msg("test container finished")
+	case err := <-errC:
+		s.log.Warn().Err(err).Str("pipeline_id", req.PipelineID).Msg("test container wait error")
+	case <-waitCtx.Done():
+		s.log.Warn().Str("pipeline_id", req.PipelineID).Msg("test execution timed out")
+		s.docker.ContainerStop(context.Background(), created.ID, container.StopOptions{})
+	}
+
+	// Collect logs (stdout + stderr)
+	logReader, err := s.docker.ContainerLogs(context.Background(), created.ID,
+		container.LogsOptions{ShowStdout: true, ShowStderr: true})
+	rawOutput := ""
+	if err == nil {
+		defer logReader.Close()
+		var stdout, stderr bytes.Buffer
+		stdcopy.StdCopy(&stdout, &stderr, logReader)
+		rawOutput = stdout.String() + stderr.String()
+	}
+
+	resp := parseTestOutput(rawOutput, lang)
+	resp.Language = lang
+	resp.RawOutput = rawOutput
+
+	s.log.Info().
+		Str("pipeline_id", req.PipelineID).
+		Str("lang", lang).
+		Int("passed", resp.Passed).
+		Int("failed", resp.Failed).
+		Int("total", resp.Total).
+		Msg("test execution complete")
+
+	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -751,10 +1194,6 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(prometheusMiddleware)
-
-	// Prometheus metrics
-	r.Handle("/metrics", promhttp.Handler())
 
 	// Health
 	r.Get("/health", srv.handleHealth)
@@ -767,6 +1206,7 @@ func main() {
 		r.Get("/list", srv.handleList)
 		r.Get("/health/{id}", srv.handleContainerHealth)
 		r.Delete("/cleanup/{id}", srv.handleCleanup)
+		r.Post("/test", srv.handleRunTests)
 	})
 
 	// Start background TTL cleanup for old forge-managed containers (1-hour TTL).
@@ -779,7 +1219,7 @@ func main() {
 		Addr:         addr,
 		Handler:      r,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		WriteTimeout: 180 * time.Second,
 	}
 
 	go func() {

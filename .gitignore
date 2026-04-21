@@ -137,3 +137,7 @@ obj/
 /chroma_db
 /postgres_data
 /redis_data
+
+# Local build artifacts / analysis output
+graphify-out/
+forge-docker-svc/forge-docker-svc
