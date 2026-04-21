@@ -15,11 +15,13 @@ class OllamaClient:
     def __init__(self):
         self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         self._client: AsyncClient | None = None
+        self._client_lock = asyncio.Lock()
 
-    @property
-    def client(self) -> AsyncClient:
+    async def _get_client(self) -> AsyncClient:
         if self._client is None:
-            self._client = AsyncClient(host=self.base_url)
+            async with self._client_lock:
+                if self._client is None:
+                    self._client = AsyncClient(host=self.base_url)
         return self._client
 
     async def generate(
@@ -42,62 +44,88 @@ class OllamaClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        try:
-            response = await asyncio.wait_for(
-                self.client.chat(
-                    model=model,
-                    messages=messages,
-                    options={
-                        "temperature": temperature,
-                        "num_predict": max_tokens,
-                    },
-                ),
-                timeout=timeout,
-            )
+        fallback_model = os.getenv("MODEL_FALLBACK", "deepseek-v3.2:cloud")
+        max_attempts = max(1, int(os.getenv("OLLAMA_MAX_ATTEMPTS", "3")))
+        retry_base_seconds = max(0.1, float(os.getenv("OLLAMA_RETRY_BASE_SECONDS", "1.0")))
+        models_to_try = [model]
+        if model != fallback_model:
+            models_to_try.append(fallback_model)
 
-            duration_ms = int((time.monotonic() - start) * 1000)
-            # SDK v0.4.x returns a ChatResponse object — use attribute access
-            tokens = getattr(response, "eval_count", 0) + getattr(response, "prompt_eval_count", 0)
+        last_error: Exception | None = None
+        for attempt_model in models_to_try:
+            for attempt in range(1, max_attempts + 1):
+                attempt_start = time.monotonic()
+                try:
+                    client = await self._get_client()
+                    response = await asyncio.wait_for(
+                        client.chat(
+                            model=attempt_model,
+                            messages=messages,
+                            options={
+                                "temperature": temperature,
+                                "num_predict": max_tokens,
+                            },
+                        ),
+                        timeout=timeout,
+                    )
 
-            logger.info(
-                "ollama_generate",
-                model=model,
-                tokens=tokens,
-                duration_ms=duration_ms,
-            )
+                    duration_ms = int((time.monotonic() - attempt_start) * 1000)
+                    tokens = getattr(response, "eval_count", 0) + getattr(response, "prompt_eval_count", 0)
 
-            # Thinking models (e.g. qwen3.5) may put output in the thinking
-            # field and leave message.content empty.  Prefer message.content
-            # but fall back to the thinking field so we never return "".
-            content = response.message.content or ""
-            if not content.strip():
-                # Try common thinking-model attributes
-                thinking = getattr(response.message, "thinking", None) or getattr(response, "thinking", None) or ""
-                if thinking:
-                    content = thinking
+                    if attempt_model != model:
+                        logger.warning("ollama_fallback_used", primary=model, fallback=attempt_model)
 
-            return {
-                "response": content,
-                "tokens_used": tokens,
-                "duration_ms": duration_ms,
-                "model": model,
-            }
-        except Exception as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            logger.error("ollama_generate_error", model=model, error=str(e), duration_ms=duration_ms)
-            raise
+                    logger.info(
+                        "ollama_generate",
+                        model=attempt_model,
+                        attempt=attempt,
+                        tokens=tokens,
+                        duration_ms=duration_ms,
+                    )
+
+                    content = response.message.content or ""
+                    if not content.strip():
+                        thinking = getattr(response.message, "thinking", None) or getattr(response, "thinking", None) or ""
+                        if thinking:
+                            content = thinking
+
+                    return {
+                        "response": content,
+                        "tokens_used": tokens,
+                        "duration_ms": duration_ms,
+                        "model": attempt_model,
+                    }
+                except Exception as e:
+                    duration_ms = int((time.monotonic() - attempt_start) * 1000)
+                    last_error = e
+                    should_retry = attempt < max_attempts
+                    logger.error(
+                        "ollama_generate_error",
+                        model=attempt_model,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        will_retry=should_retry,
+                        error=str(e),
+                        duration_ms=duration_ms,
+                    )
+                    if should_retry:
+                        await asyncio.sleep(min(retry_base_seconds * (2 ** (attempt - 1)), 8.0))
+
+        raise last_error
 
     async def embed(self, text: str, model: str | None = None) -> list[float]:
         """Generate embeddings for text."""
         model = model or os.getenv("MODEL_EMBEDDING", "nomic-embed-text")
         # SDK v0.4.x uses .embed() and returns an EmbedResponse object
-        response = await self.client.embed(model=model, input=text)
+        client = await self._get_client()
+        response = await client.embed(model=model, input=text)
         return response.embeddings[0]
 
     async def health(self) -> bool:
         """Check if Ollama is reachable."""
         try:
-            await self.client.list()
+            client = await self._get_client()
+            await client.list()
             return True
         except Exception:
             return False

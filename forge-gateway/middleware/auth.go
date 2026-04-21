@@ -17,6 +17,19 @@ const (
 	ClaimsKey contextKey = "jwt_claims"
 )
 
+// GetUserID extracts the user_id claim from the request context.
+// Returns "anonymous" when auth is disabled or the claim is absent.
+func GetUserID(r *http.Request) string {
+	claims, ok := r.Context().Value(ClaimsKey).(jwt.MapClaims)
+	if !ok {
+		return "anonymous"
+	}
+	if uid, ok := claims["user_id"].(string); ok && uid != "" {
+		return uid
+	}
+	return "anonymous"
+}
+
 // JWTAuth validates a Bearer token using HS256 and the JWT_SECRET env var.
 // Requests to /health are skipped.
 func JWTAuth(next http.Handler) http.Handler {
@@ -25,17 +38,9 @@ func JWTAuth(next http.Handler) http.Handler {
 		log.Warn().Msg("JWT_SECRET not set – auth will reject all requests")
 	}
 
-	devMode := os.Getenv("DEV_MODE") == "true"
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health check and metrics.
-		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// In dev mode, skip auth entirely (no login UI yet).
-		if devMode {
+		// Skip health check.
+		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}

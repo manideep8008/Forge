@@ -25,6 +25,7 @@ class PipelineState(BaseModel):
     # Iteration: user message + existing files from a previous completed pipeline
     modification_request: str = ""
     existing_files: dict[str, str] = Field(default_factory=dict)
+    parent_pipeline_id: str | None = None
 
 
     # Stage tracking

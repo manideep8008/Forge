@@ -14,11 +14,16 @@ export default defineConfig({
     host: '0.0.0.0',
     proxy: {
       '/api': {
-        target: process.env.VITE_API_URL || 'http://forge-gateway:8080',
+        target: process.env.VITE_API_URL || 'http://localhost:8080',
+        changeOrigin: true,
+      },
+      '/auth': {
+        target: process.env.VITE_API_URL || 'http://localhost:8080',
         changeOrigin: true,
       },
       '/ws': {
-        target: process.env.VITE_WS_URL || 'ws://forge-gateway:8080',
+        target: process.env.VITE_API_URL || 'http://localhost:8080',
+        changeOrigin: true,
         ws: true,
       },
     },

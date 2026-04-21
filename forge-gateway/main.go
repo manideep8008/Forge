@@ -9,13 +9,13 @@ import (
 	"syscall"
 	"time"
 
+	"forge-gateway/database"
 	"forge-gateway/handlers"
 	"forge-gateway/middleware"
 	wshub "forge-gateway/websocket"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -25,6 +25,11 @@ func main() {
 	// Structured JSON logging via zerolog.
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Str("service", "forge-gateway").Logger()
+
+	// ── PostgreSQL pool ─────────────────────────────────────────────
+	if err := database.Init(context.Background()); err != nil {
+		log.Warn().Err(err).Msg("postgres not reachable at startup – auth endpoints will be unavailable")
+	}
 
 	// ── Redis client ────────────────────────────────────────────────
 	redisURL := envOrDefault("REDIS_URL", "redis://localhost:6379")
@@ -37,8 +42,13 @@ func main() {
 		log.Warn().Err(err).Msg("redis not reachable at startup – will retry on demand")
 	}
 
+	// ── JWT secret validation ──────────────────────────────────────
+	if os.Getenv("JWT_SECRET") == "" {
+		log.Fatal().Msg("JWT_SECRET environment variable is not set — this is required in production")
+	}
+
 	// ── WebSocket hub ───────────────────────────────────────────────
-	hub := wshub.NewHub(rdb)
+	hub := wshub.NewHub(rdb, database.Pool())
 	go hub.Run()
 
 	// ── Router ──────────────────────────────────────────────────────
@@ -52,7 +62,13 @@ func main() {
 
 	// Public endpoints (no auth, no response-wrapping logger).
 	r.Get("/health", handlers.Health(rdb))
-	r.Handle("/metrics", promhttp.Handler())
+
+	// Auth endpoints (unauthenticated).
+	authHandler := handlers.NewAuthHandler(rdb)
+	r.Post("/auth/register", authHandler.Register)
+	r.Post("/auth/login", authHandler.Login)
+	r.Post("/auth/refresh", authHandler.Refresh)
+	r.Post("/auth/logout", authHandler.Logout)
 
 	// WebSocket – no ResponseWriter-wrapping middleware (breaks http.Hijacker).
 	r.Get("/ws/pipeline/{id}", hub.ServeWS)
@@ -73,7 +89,24 @@ func main() {
 		api.Post("/api/pipeline/{id}/cancel", handlers.CancelPipeline)
 		api.Post("/api/pipeline/{id}/retry", handlers.RetryPipeline)
 		api.Post("/api/pipeline/{id}/modify", handlers.ModifyPipeline)
+		api.Post("/api/pipeline/{id}/fork", handlers.ProxyHandler())
 		api.Get("/api/pipelines", handlers.ListPipelines)
+
+		// Collaboration + intelligence features (generic proxy to orchestrator).
+		api.Get("/api/pipeline/{id}/comments", handlers.ProxyHandler())
+		api.Post("/api/pipeline/{id}/comments", handlers.ProxyHandler())
+		api.Get("/api/workspaces", handlers.ProxyHandler())
+		api.Post("/api/workspaces", handlers.ProxyHandler())
+		api.Get("/api/workspaces/{id}", handlers.ProxyHandler())
+		api.Post("/api/workspaces/{id}/members", handlers.ProxyHandler())
+		api.Get("/api/workspaces/{id}/pipelines", handlers.ProxyHandler())
+		api.Get("/api/templates", handlers.ProxyHandler())
+		api.Post("/api/templates", handlers.ProxyHandler())
+		api.Delete("/api/templates/{id}", handlers.ProxyHandler())
+		api.Get("/api/schedules", handlers.ProxyHandler())
+		api.Post("/api/schedules", handlers.ProxyHandler())
+		api.Patch("/api/schedules/{id}", handlers.ProxyHandler())
+		api.Delete("/api/schedules/{id}", handlers.ProxyHandler())
 	})
 
 	// ── Server ──────────────────────────────────────────────────────
@@ -108,6 +141,7 @@ func main() {
 		log.Error().Err(err).Msg("server shutdown error")
 	}
 	_ = rdb.Close()
+	database.Close()
 	fmt.Println("bye")
 }
 

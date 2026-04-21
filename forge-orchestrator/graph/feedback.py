@@ -72,14 +72,3 @@ def should_retry_test(state: PipelineState) -> str:
         ),
     )
     return "codegen"
-
-
-def should_rollback(state: PipelineState) -> str:
-    """Decide whether to rollback after monitoring.
-
-    Returns: "rollback" or "complete".
-    """
-    if state.should_rollback:
-        logger.warning("monitor_rollback", pipeline_id=state.pipeline_id)
-        return "rollback"
-    return "complete"

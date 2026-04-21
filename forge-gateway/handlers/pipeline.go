@@ -1,18 +1,36 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
+	"forge-gateway/middleware"
+
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
+// validatePipelineID checks that id is a valid UUID and writes a 400 if not.
+// Returns false when the handler should stop.
+func validatePipelineID(w http.ResponseWriter, id string) bool {
+	if _, err := uuid.Parse(id); err != nil {
+		jsonError(w, "invalid pipeline id", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 var orchestratorURL = envOrDefault("ORCHESTRATOR_URL", "http://forge-orchestrator:8090")
+
+const maxCreatePipelineBodyBytes = 1 << 20
 
 // ---------- request / response types ----------
 
@@ -40,8 +58,14 @@ type PipelineResponse struct {
 // CreatePipeline forwards the request body to the orchestrator service.
 // POST /api/pipeline
 func CreatePipeline(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCreatePipelineBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			jsonError(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		jsonError(w, "failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -66,8 +90,10 @@ func CreatePipeline(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-marshal with normalized fields for the orchestrator.
+	userID := middleware.GetUserID(r)
 	normalized, _ := json.Marshal(map[string]string{
 		"input_text": req.Prompt,
+		"user_id":    userID,
 	})
 
 	// Forward to orchestrator.
@@ -87,6 +113,9 @@ func CreatePipeline(w http.ResponseWriter, r *http.Request) {
 // GET /api/pipeline/{id}/status
 func GetPipelineStatus(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if !validatePipelineID(w, id) {
+		return
+	}
 	url := fmt.Sprintf("%s/pipeline/%s/status", orchestratorURL, id)
 
 	resp, err := proxyGet(url, r)
@@ -104,6 +133,9 @@ func GetPipelineStatus(w http.ResponseWriter, r *http.Request) {
 // GET /api/pipeline/{id}/diff
 func GetPipelineDiff(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if !validatePipelineID(w, id) {
+		return
+	}
 	url := fmt.Sprintf("%s/pipeline/%s/diff", orchestratorURL, id)
 
 	resp, err := proxyGet(url, r)
@@ -121,6 +153,9 @@ func GetPipelineDiff(w http.ResponseWriter, r *http.Request) {
 // POST /api/pipeline/{id}/approve
 func ApprovePipeline(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if !validatePipelineID(w, id) {
+		return
+	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -141,12 +176,17 @@ func ApprovePipeline(w http.ResponseWriter, r *http.Request) {
 	relayResponse(w, resp)
 }
 
-// ListPipelines returns all pipelines (with optional query params for filtering).
+// ListPipelines returns pipelines for the authenticated user.
 // GET /api/pipelines
 func ListPipelines(w http.ResponseWriter, r *http.Request) {
-	url := fmt.Sprintf("%s/pipelines?%s", orchestratorURL, r.URL.RawQuery)
+	userID := middleware.GetUserID(r)
+	q := r.URL.Query()
+	if userID != "anonymous" {
+		q.Set("user_id", userID)
+	}
+	targetURL := fmt.Sprintf("%s/pipelines?%s", orchestratorURL, url.Values(q).Encode())
 
-	resp, err := proxyGet(url, r)
+	resp, err := proxyGet(targetURL, r)
 	if err != nil {
 		log.Error().Err(err).Msg("orchestrator unreachable")
 		jsonError(w, "orchestrator unavailable", http.StatusBadGateway)
@@ -161,6 +201,9 @@ func ListPipelines(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/pipeline/{id}
 func DeletePipeline(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if !validatePipelineID(w, id) {
+		return
+	}
 	url := fmt.Sprintf("%s/pipeline/%s", orchestratorURL, id)
 
 	resp, err := proxyDelete(url, r)
@@ -178,6 +221,9 @@ func DeletePipeline(w http.ResponseWriter, r *http.Request) {
 // POST /api/pipeline/{id}/cancel
 func CancelPipeline(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if !validatePipelineID(w, id) {
+		return
+	}
 	url := fmt.Sprintf("%s/pipeline/%s/cancel", orchestratorURL, id)
 
 	resp, err := proxyPost(url, nil, r)
@@ -195,6 +241,9 @@ func CancelPipeline(w http.ResponseWriter, r *http.Request) {
 // POST /api/pipeline/{id}/retry
 func RetryPipeline(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if !validatePipelineID(w, id) {
+		return
+	}
 	url := fmt.Sprintf("%s/pipeline/%s/retry", orchestratorURL, id)
 
 	resp, err := proxyPost(url, nil, r)
@@ -212,6 +261,9 @@ func RetryPipeline(w http.ResponseWriter, r *http.Request) {
 // POST /api/pipeline/{id}/modify
 func ModifyPipeline(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if !validatePipelineID(w, id) {
+		return
+	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -276,12 +328,18 @@ func propagateHeaders(from, to *http.Request) {
 	if v := from.Header.Get("Authorization"); v != "" {
 		to.Header.Set("Authorization", v)
 	}
+	// Forward the authenticated user ID so the orchestrator can enforce ownership.
+	if uid := middleware.GetUserID(from); uid != "anonymous" {
+		to.Header.Set("X-User-ID", uid)
+	}
 }
 
 func relayResponse(w http.ResponseWriter, resp *http.Response) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Error().Err(err).Int("status_code", resp.StatusCode).Msg("failed to relay orchestrator response")
+	}
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
@@ -291,19 +349,7 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 }
 
 func jsonReader(data []byte) io.Reader {
-	return io.NopCloser(bytesReader(data))
-}
-
-type bytesReaderWrapper struct{ data []byte; pos int }
-
-func bytesReader(data []byte) *bytesReaderWrapper { return &bytesReaderWrapper{data: data} }
-func (br *bytesReaderWrapper) Read(p []byte) (int, error) {
-	if br.pos >= len(br.data) {
-		return 0, io.EOF
-	}
-	n := copy(p, br.data[br.pos:])
-	br.pos += n
-	return n, nil
+	return bytes.NewReader(data)
 }
 
 func envOrDefault(key, fallback string) string {

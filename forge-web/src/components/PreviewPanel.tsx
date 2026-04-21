@@ -1,15 +1,27 @@
 import { useState } from 'react';
-import { ExternalLink, RefreshCw, Loader2, Monitor, Layers } from 'lucide-react';
-import type { Pipeline } from '../types';
+import {
+  ExternalLink,
+  RefreshCw,
+  Monitor,
+  Layers,
+  Activity,
+  CheckCircle2,
+  Loader2,
+  XCircle,
+} from 'lucide-react';
+import type { Pipeline, PipelineEvent } from '../types';
 import StageProgressBar from './StageProgressBar';
+import StageDetailCard from './StageDetailCard';
+import ActivityFeed from './ActivityFeed';
 
 interface PreviewPanelProps {
   pipeline: Pipeline | null;
+  events?: PipelineEvent[];
 }
 
 type Tab = 'preview' | 'progress';
 
-export default function PreviewPanel({ pipeline }: PreviewPanelProps) {
+export default function PreviewPanel({ pipeline, events = [] }: PreviewPanelProps) {
   const [tab, setTab] = useState<Tab>('progress');
   const [iframeKey, setIframeKey] = useState(0);
 
@@ -19,6 +31,11 @@ export default function PreviewPanel({ pipeline }: PreviewPanelProps) {
 
   // Auto-switch to preview when deploy URL is available
   const effectiveTab = deployUrl ? tab : 'progress';
+
+  // Pipeline summary stats
+  const completedStages = pipeline?.stages.filter((s) => s.status === 'completed').length ?? 0;
+  const totalStages = pipeline?.stages.length ?? 0;
+  const totalTokens = pipeline?.agents.reduce((sum, a) => sum + (a.tokens_used ?? 0), 0) ?? 0;
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-forge-bg/20">
@@ -55,7 +72,23 @@ export default function PreviewPanel({ pipeline }: PreviewPanelProps) {
         </button>
 
         {/* Spacer + actions */}
-        <div className="ml-auto flex items-center gap-1 pb-1">
+        <div className="ml-auto flex items-center gap-2 pb-1">
+          {/* Quick stats */}
+          {pipeline && effectiveTab === 'progress' && (
+            <div className="flex items-center gap-2 text-[10px] text-forge-muted/60">
+              {completedStages > 0 && (
+                <span className="flex items-center gap-1 bg-white/5 px-1.5 py-0.5 rounded">
+                  {completedStages}/{totalStages}
+                </span>
+              )}
+              {totalTokens > 0 && (
+                <span className="flex items-center gap-1 bg-white/5 px-1.5 py-0.5 rounded tabular-nums">
+                  {totalTokens.toLocaleString()} tok
+                </span>
+              )}
+            </div>
+          )}
+
           {effectiveTab === 'preview' && deployUrl && (
             <>
               <button
@@ -104,21 +137,20 @@ export default function PreviewPanel({ pipeline }: PreviewPanelProps) {
                 {/* Stage progress bar */}
                 <StageProgressBar stages={pipeline.stages} />
 
-                {/* Active stage indicator */}
-                {pipeline.status === 'running' && pipeline.current_stage && (
-                  <div className="flex items-center gap-2 px-4 py-3 bg-indigo-500/10 border border-indigo-500/20 rounded-xl animate-pulse-subtle">
-                    <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
-                    <div>
-                      <p className="text-xs font-semibold text-indigo-300 capitalize">{pipeline.current_stage}</p>
-                      <p className="text-xs text-indigo-300/60">Agent is working…</p>
-                    </div>
+                {/* Active stage detail card */}
+                {(pipeline.status === 'running' || pipeline.status === 'completed' || pipeline.status === 'failed' || pipeline.status === 'awaiting_approval') && (
+                  <div className="animate-slide-up">
+                    <StageDetailCard pipeline={pipeline} />
                   </div>
                 )}
 
                 {/* Completion summary */}
                 {pipeline.status === 'completed' && (
-                  <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
-                    <p className="text-xs font-semibold text-emerald-400 mb-1">✅ Pipeline Complete</p>
+                  <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl animate-slide-up">
+                    <div className="flex items-center gap-2 mb-1">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      <p className="text-xs font-semibold text-emerald-400">Pipeline Complete</p>
+                    </div>
                     {deployUrl ? (
                       <p className="text-xs text-emerald-300/70">
                         App deployed at{' '}
@@ -130,6 +162,48 @@ export default function PreviewPanel({ pipeline }: PreviewPanelProps) {
                     ) : (
                       <p className="text-xs text-emerald-300/70">All stages completed successfully.</p>
                     )}
+                  </div>
+                )}
+
+                {/* Failed summary */}
+                {pipeline.status === 'failed' && (
+                  <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl animate-slide-up">
+                    <div className="flex items-center gap-2 mb-1">
+                      <XCircle className="w-4 h-4 text-red-400" />
+                      <p className="text-xs font-semibold text-red-400">Pipeline Failed</p>
+                    </div>
+                    <p className="text-xs text-red-300/70">Check the stage details above for error information.</p>
+                  </div>
+                )}
+
+                {/* Activity Feed */}
+                {events.length > 0 && (
+                  <div className="animate-slide-up">
+                    <div className="flex items-center gap-2 mb-3">
+                      <Activity className="w-3.5 h-3.5 text-forge-muted/50" />
+                      <h3 className="text-[10px] font-semibold text-forge-muted/50 uppercase tracking-widest">
+                        Activity ({events.length})
+                      </h3>
+                    </div>
+                    <div className="card p-4">
+                      <ActivityFeed events={events} />
+                    </div>
+                  </div>
+                )}
+
+                {/* Minimal fallback when we have a pipeline but no events yet */}
+                {events.length === 0 && pipeline.status === 'running' && (
+                  <div className="card p-4 animate-slide-up">
+                    <div className="flex items-center gap-2 mb-3">
+                      <Activity className="w-3.5 h-3.5 text-forge-muted/50" />
+                      <h3 className="text-[10px] font-semibold text-forge-muted/50 uppercase tracking-widest">
+                        Activity
+                      </h3>
+                    </div>
+                    <div className="flex items-center justify-center py-4 text-forge-muted/50 text-xs">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
+                      Waiting for pipeline events…
+                    </div>
                   </div>
                 )}
               </>

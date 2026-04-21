@@ -23,17 +23,19 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply bg-indigo-500/20 rounded-full;
+    background: rgba(110, 118, 129, 0.25);
+    border-radius: 9999px;
     transition: background 0.2s;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    @apply bg-indigo-500/40;
+    background: rgba(110, 118, 129, 0.5);
   }
 
   /* Selection styling */
   ::selection {
-    @apply bg-indigo-500/30 text-white;
+    background: rgba(230, 237, 243, 0.15);
+    color: #ffffff;
   }
 }
 
@@ -48,25 +50,29 @@
     @apply border-forge-border-bright;
   }
 
-  /* Gradient accent card */
+  /* Subtle accent card */
   .card-accent {
     @apply card;
-    background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(139, 92, 246, 0.03) 100%);
+    background: rgba(22, 27, 34, 0.8);
   }
 
-  /* Primary button with gradient */
+  /* Primary button — clean white on dark */
   .btn-primary {
-    @apply text-white font-medium px-4 py-2.5 rounded-xl transition-all duration-200;
-    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-    box-shadow: 0 2px 10px rgba(99, 102, 241, 0.25);
+    @apply font-medium px-4 py-2.5 rounded-xl transition-all duration-200;
+    background: #21262d;
+    color: #e6edf3;
+    border: 1px solid rgba(110, 118, 129, 0.4);
+    box-shadow: 0 1px 0 rgba(27, 31, 35, 0.1);
   }
 
   .btn-primary:hover {
-    box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
-    transform: translateY(-1px);
+    background: #30363d;
+    border-color: rgba(110, 118, 129, 0.6);
+    color: #ffffff;
   }
 
   .btn-primary:active {
+    background: #282e35;
     transform: translateY(0);
   }
 
@@ -111,9 +117,9 @@
 
   /* Modern input */
   .input-modern {
-    @apply w-full bg-forge-bg/80 border border-forge-border rounded-xl px-3 py-2.5
+    @apply w-full bg-forge-bg border border-forge-border rounded-xl px-3 py-2.5
       text-sm text-forge-text placeholder-forge-muted/60
-      focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/50
+      focus:outline-none focus:ring-1 focus:border-forge-border-bright
       transition-all duration-200;
   }
 
@@ -122,12 +128,27 @@
     @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium;
   }
 
-  /* Ambient background mesh */
+  /* Subtle background — no color noise */
   .bg-mesh {
-    background-image:
-      radial-gradient(at 27% 37%, rgba(99, 102, 241, 0.08) 0px, transparent 50%),
-      radial-gradient(at 97% 21%, rgba(139, 92, 246, 0.06) 0px, transparent 50%),
-      radial-gradient(at 52% 99%, rgba(99, 102, 241, 0.04) 0px, transparent 50%),
-      radial-gradient(at 10% 29%, rgba(139, 92, 246, 0.03) 0px, transparent 50%);
+    background-image: none;
+  }
+
+  /* Multi-line text clamping */
+  .line-clamp-1 {
+    display: -webkit-box;
+    -webkit-line-clamp: 1;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* Pulse subtle animation for active stage indicators */
+  .animate-pulse-subtle {
+    animation: pulse-subtle 3s ease-in-out infinite;
   }
 }

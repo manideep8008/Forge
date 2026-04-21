@@ -2,8 +2,9 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import type { Pipeline, PipelineEvent, PipelineStage, StageName } from '../types';
 import { useWebSocket } from './useWebSocket';
 import { STAGE_ORDER } from '../types';
+import { useAuth } from '../context/AuthContext';
 
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'halted', 'rolled_back']);
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'halted', 'rolled_back', 'cancelled']);
 
 interface UsePipelineReturn {
   pipeline: Pipeline | null;
@@ -19,16 +20,24 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
   const [pipeline, setPipeline] = useState<Pipeline | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const errorCountRef = useRef(0);
   const { connected, events, lastEvent } = useWebSocket(pipelineId);
+  const { authFetch } = useAuth();
 
   const fetchPipeline = useCallback(async (isPolling = false) => {
-    if (!pipelineId) return;
+    if (!pipelineId) {
+      setPipeline(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
 
     try {
       if (!isPolling) setLoading(true);
       setError(null);
-      const res = await fetch(`/api/pipeline/${pipelineId}`);
+      const res = await authFetch(`/api/pipeline/${pipelineId}/status`);
       if (!res.ok) throw new Error(`Failed to fetch pipeline: ${res.statusText}`);
+      errorCountRef.current = 0;
       const raw = await res.json();
       // Normalize API response to match Pipeline type
       const defaultStages: PipelineStage[] = STAGE_ORDER.map((name: StageName) => ({
@@ -48,24 +57,41 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
       };
       setPipeline(data);
     } catch (err) {
+      errorCountRef.current += 1;
       setError(err instanceof Error ? err.message : 'Unknown error');
+      // Stop polling after 5 consecutive failures to avoid endless noise
+      if (errorCountRef.current >= 5 && intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
     } finally {
       setLoading(false);
     }
-  }, [pipelineId]);
+  }, [pipelineId, authFetch]);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    fetchPipeline(false);
+    if (!pipelineId) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      setPipeline(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    void fetchPipeline(false);
     // Poll every 3s while pipeline is active (not completed/failed)
     intervalRef.current = setInterval(() => {
-      fetchPipeline(true);
+      void fetchPipeline(true);
     }, 3000);
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [fetchPipeline]);
+  }, [fetchPipeline, pipelineId]);
 
   // Stop polling when pipeline reaches a terminal state
   useEffect(() => {
@@ -129,11 +155,9 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
               (a) => a.agent === lastEvent.agent && a.stage === lastEvent.stage,
             );
             if (existingIdx >= 0) {
-              updated.agents = [...prev.agents];
-              updated.agents[existingIdx] = {
-                ...updated.agents[existingIdx],
-                ...agentData,
-              };
+              updated.agents = prev.agents.map((a, i) =>
+                i === existingIdx ? { ...a, ...agentData } : a,
+              );
             } else {
               updated.agents = [
                 ...prev.agents,

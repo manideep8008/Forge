@@ -14,10 +14,13 @@ export function useWebSocket(pipelineId: string | undefined): UseWebSocketReturn
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const closedIntentionallyRef = useRef(false);
   const maxReconnectAttempts = 10;
 
   const connect = useCallback(() => {
     if (!pipelineId) return;
+
+    closedIntentionallyRef.current = false;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
@@ -33,17 +36,29 @@ export function useWebSocket(pipelineId: string | undefined): UseWebSocketReturn
 
     ws.onmessage = (event) => {
       try {
-        const parsed: PipelineEvent = JSON.parse(event.data);
+        const raw = JSON.parse(event.data);
+        // Orchestrator publishes `event_type`; normalize to `type` for the frontend.
+        const parsed: PipelineEvent = {
+          ...raw,
+          type: raw.type ?? raw.event_type,
+          stage: raw.stage ?? raw.payload?.stage,
+          agent: raw.agent ?? raw.payload?.agent,
+          data: raw.data ?? raw.payload,
+          timestamp: raw.timestamp ?? new Date().toISOString(),
+        };
         setEvents((prev) => [...prev, parsed]);
         setLastEvent(parsed);
       } catch {
-        console.error('Failed to parse WebSocket message:', event.data);
+        // Silently ignore unparseable messages
       }
     };
 
     ws.onclose = () => {
       setConnected(false);
       wsRef.current = null;
+
+      // Don't reconnect if the close was triggered by cleanup (unmount)
+      if (closedIntentionallyRef.current) return;
 
       if (reconnectAttemptRef.current < maxReconnectAttempts) {
         const delay = Math.min(
@@ -70,6 +85,7 @@ export function useWebSocket(pipelineId: string | undefined): UseWebSocketReturn
     connect();
 
     return () => {
+      closedIntentionallyRef.current = true;
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }

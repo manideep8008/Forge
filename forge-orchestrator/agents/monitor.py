@@ -5,6 +5,7 @@ import json
 import os
 
 import httpx
+import structlog
 from agents.base import BaseAgent
 from agents.codegen import _extract_json
 from models.schemas import AgentResult
@@ -32,10 +33,14 @@ Rollback if:
 - Response time > 5000ms
 - Health checks failing > 50%
 
-Always respond with valid JSON only."""
+You may reason internally, but your final output must be valid JSON only.
+Do NOT wrap the JSON in markdown code fences."""
 
 ERROR_RATE_THRESHOLD = 0.05
 RESPONSE_TIME_THRESHOLD = 5000
+
+
+logger = structlog.get_logger()
 
 
 class MonitorAgent(BaseAgent):

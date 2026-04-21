@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -20,10 +21,13 @@ class ContextManager:
     def __init__(self):
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
         self._redis: redis.Redis | None = None
+        self._redis_lock = asyncio.Lock()
 
     async def _get_redis(self) -> redis.Redis:
         if self._redis is None:
-            self._redis = redis.from_url(self.redis_url, decode_responses=True)
+            async with self._redis_lock:
+                if self._redis is None:
+                    self._redis = redis.from_url(self.redis_url, decode_responses=True)
         return self._redis
 
     def _key(self, pipeline_id: str) -> str:
@@ -109,9 +113,9 @@ class ContextManager:
         channel = f"ws:{pipeline_id}"
         await pubsub.subscribe(channel)
 
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
         try:
-            while asyncio.get_event_loop().time() < deadline:
+            while asyncio.get_running_loop().time() < deadline:
                 # Check current value first (covers race where value was set
                 # before we subscribed).
                 current = await self.get(pipeline_id, field)
@@ -119,7 +123,7 @@ class ContextManager:
                     return current
 
                 # Wait for a pub/sub message or fall back after poll_fallback seconds.
-                remaining = deadline - asyncio.get_event_loop().time()
+                remaining = deadline - asyncio.get_running_loop().time()
                 wait_time = min(poll_fallback, remaining)
                 if wait_time <= 0:
                     break

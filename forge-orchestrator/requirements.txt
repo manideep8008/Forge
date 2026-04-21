@@ -10,6 +10,6 @@ chromadb==0.5.23
 pydantic==2.10.3
 structlog==24.4.0
 httpx==0.27.2
-prometheus-client==0.21.1
 python-dotenv==1.0.1
+croniter==3.0.3
 pytest==8.3.4

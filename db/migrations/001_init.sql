@@ -13,10 +13,12 @@ CREATE TABLE pipelines (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     error_message TEXT,
+    parent_pipeline_id UUID REFERENCES pipelines(id) ON DELETE SET NULL,
     metadata JSONB DEFAULT '{}'
 );
 
 CREATE INDEX idx_pipelines_user ON pipelines(user_id);
+CREATE INDEX idx_pipelines_parent ON pipelines(parent_pipeline_id);
 CREATE INDEX idx_pipelines_status ON pipelines(status);
 CREATE INDEX idx_pipelines_created ON pipelines(created_at DESC);
 
