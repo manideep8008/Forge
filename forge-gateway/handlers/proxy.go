@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"strings"
 
 	"forge-gateway/middleware"
@@ -16,6 +17,11 @@ import (
 // can identify the caller without re-parsing the token.
 func ProxyHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if hasDotDotPathSegment(r.URL.EscapedPath()) {
+			jsonError(w, "invalid proxy path", http.StatusBadRequest)
+			return
+		}
+
 		userID := middleware.GetUserID(r)
 
 		// Strip the /api gateway prefix — the orchestrator routes have no such prefix.
@@ -32,9 +38,17 @@ func ProxyHandler() http.HandlerFunc {
 		case http.MethodGet:
 			resp, err = proxyGetWithUser(target, r, userID)
 		case http.MethodPost:
-			resp, err = proxyPostWithUser(target, nil, r, userID)
+			body, ok := readLimitedRequestBody(w, r, maxProxyBodyBytes)
+			if !ok {
+				return
+			}
+			resp, err = proxyPostWithUser(target, body, r, userID)
 		case http.MethodPatch:
-			resp, err = proxyPostWithUser(target, nil, r, userID) // reuse post helper
+			body, ok := readLimitedRequestBody(w, r, maxProxyBodyBytes)
+			if !ok {
+				return
+			}
+			resp, err = proxyPostWithUser(target, body, r, userID) // reuse post helper
 		case http.MethodDelete:
 			resp, err = proxyDeleteWithUser(target, r, userID)
 		default:
@@ -52,6 +66,19 @@ func ProxyHandler() http.HandlerFunc {
 	}
 }
 
+func hasDotDotPathSegment(rawPath string) bool {
+	decodedPath, err := neturl.PathUnescape(rawPath)
+	if err != nil {
+		return true
+	}
+	for _, segment := range strings.Split(decodedPath, "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 // proxyGetWithUser is like proxyGet but also sets X-User-ID on the outgoing request.
 func proxyGetWithUser(url string, orig *http.Request, userID string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(orig.Context(), http.MethodGet, url, nil)
@@ -65,7 +92,7 @@ func proxyGetWithUser(url string, orig *http.Request, userID string) (*http.Resp
 
 // proxyPostWithUser proxies a POST (or PATCH) forwarding the original body and X-User-ID.
 func proxyPostWithUser(url string, body []byte, orig *http.Request, userID string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(orig.Context(), orig.Method, url, orig.Body)
+	req, err := http.NewRequestWithContext(orig.Context(), orig.Method, url, jsonReader(body))
 	if err != nil {
 		return nil, err
 	}

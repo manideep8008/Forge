@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { X, Rocket, Loader2 } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
 
 interface NewPipelineModalProps {
   onClose: () => void;
@@ -7,6 +8,7 @@ interface NewPipelineModalProps {
 }
 
 export default function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) {
+  const { authFetch } = useAuth();
   const [description, setDescription] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -19,12 +21,11 @@ export default function NewPipelineModal({ onClose, onCreated }: NewPipelineModa
     setError(null);
 
     try {
-      const res = await fetch('/api/pipeline', {
+      const res = await authFetch('/api/pipeline', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           input_text: description.trim(),
-          user_id: 'test-user' // hardcoded for now, normally from auth
         }),
       });
 

@@ -11,22 +11,26 @@ import {
   RotateCcw,
   Copy,
   ExternalLink,
+  X,
 } from 'lucide-react';
 import { usePipeline } from '../hooks/usePipeline';
 import StageProgressBar from './StageProgressBar';
 import AgentCard from './AgentCard';
 import HITLGate from './HITLGate';
 import type { HITLDecision } from '../types';
+import { useAuth } from '../context/AuthContext';
 
 const ACTIVE_STATUSES = new Set(['pending', 'running', 'hitl']);
 
 export default function PipelineView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { authFetch } = useAuth();
   const { pipeline, loading, error, connected, refetch } = usePipeline(id);
   const [showHITL, setShowHITL] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const isHITLStage = pipeline
     ? (pipeline.current_stage === 'hitl' || pipeline.status === 'awaiting_approval') && pipeline.status !== 'completed'
@@ -40,7 +44,7 @@ export default function PipelineView() {
     if (isHITLStage && !showHITL) {
       setShowHITL(true);
     }
-  }, [isHITLStage]);
+  }, [isHITLStage, showHITL]);
 
   const handleAction = async (action: 'cancel' | 'delete' | 'retry') => {
     if (!id) return;
@@ -49,6 +53,7 @@ export default function PipelineView() {
     if (action === 'cancel' && !confirm('Cancel this running pipeline?')) return;
 
     setActionLoading(action);
+    setActionError(null);
     try {
       const method = action === 'delete' ? 'DELETE' : 'POST';
       const url =
@@ -56,16 +61,30 @@ export default function PipelineView() {
           ? `/api/pipeline/${id}`
           : `/api/pipeline/${id}/${action}`;
 
-      const res = await fetch(url, { method });
+      const res = await authFetch(url, { method });
       if (res.ok) {
         if (action === 'delete') {
           navigate('/');
         } else {
-          refetch();
+          await refetch();
         }
+      } else {
+        let detail = res.statusText;
+        try {
+          const body = await res.json();
+          detail = (body?.error as string) || (body?.message as string) || (body?.detail as string) || detail;
+        } catch {
+          try {
+            const text = await res.text();
+            if (text) detail = text;
+          } catch {
+            /* ignore */
+          }
+        }
+        setActionError(`Failed to ${action} pipeline: ${detail} (HTTP ${res.status})`);
       }
-    } catch {
-      console.error(`Failed to ${action} pipeline`);
+    } catch (err) {
+      setActionError(`Failed to ${action} pipeline: ${err instanceof Error ? err.message : 'network error'}`);
     } finally {
       setActionLoading(null);
     }
@@ -98,7 +117,7 @@ export default function PipelineView() {
             <AlertTriangle className="w-8 h-8 text-red-400" />
           </div>
           <p className="text-red-400 font-medium">{error ?? 'Pipeline not found'}</p>
-          <button onClick={refetch} className="btn-primary text-sm">
+          <button onClick={() => void refetch()} className="btn-primary text-sm">
             Retry
           </button>
         </div>
@@ -108,7 +127,7 @@ export default function PipelineView() {
 
   const handleHITLDecision = (_decision: HITLDecision) => {
     setShowHITL(false);
-    refetch();
+    void refetch();
   };
 
   const statusStyles: Record<string, string> = {
@@ -247,7 +266,7 @@ export default function PipelineView() {
           </button>
 
           <button
-            onClick={refetch}
+            onClick={() => void refetch()}
             className="p-2 rounded-xl hover:bg-white/5 transition-all duration-150 group"
             title="Refresh"
           >
@@ -258,6 +277,62 @@ export default function PipelineView() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-mesh">
+        {/* Action error banner */}
+        {actionError && (
+          <div className="flex items-start gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/20 animate-slide-up">
+            <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-red-400">Action failed</p>
+              <p className="text-sm text-red-300/90 break-words whitespace-pre-wrap">{actionError}</p>
+            </div>
+            <button
+              onClick={() => setActionError(null)}
+              className="p-1 rounded hover:bg-white/5 text-red-400"
+              title="Dismiss"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* Pipeline failure banner (shows failed stage errors) */}
+        {isFailed && (
+          <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/20 space-y-2 animate-slide-up">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-red-400" />
+              <p className="text-sm font-semibold text-red-400">Pipeline failed</p>
+            </div>
+            {pipeline.stages.filter((s) => s.status === 'failed').length > 0 ? (
+              <ul className="space-y-1 pl-7">
+                {pipeline.stages
+                  .filter((s) => s.status === 'failed')
+                  .map((s) => (
+                    <li key={s.name} className="text-sm text-red-300/90">
+                      <span className="font-medium capitalize">{s.name}:</span>{' '}
+                      <span className="break-words whitespace-pre-wrap">
+                        {s.error || 'no error detail provided'}
+                      </span>
+                    </li>
+                  ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-red-300/90 pl-7">
+                Check the stage details below for error information.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* WebSocket disconnected warning (only when pipeline is active) */}
+        {!connected && isActive && (
+          <div className="flex items-start gap-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 animate-slide-up">
+            <WifiOff className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-xs text-amber-300/90">
+              Live updates disconnected — falling back to polling every 3s.
+            </p>
+          </div>
+        )}
+
         {/* Stage progress */}
         <div className="animate-slide-up">
           <StageProgressBar stages={pipeline.stages} />

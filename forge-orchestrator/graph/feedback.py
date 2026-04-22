@@ -12,6 +12,10 @@ def should_retry_review(state: PipelineState) -> str:
 
     Returns: "codegen" to retry, "test" to proceed, "halt" to stop.
     """
+    if state.current_stage == "failed":
+        logger.warning("review_failed_halt", pipeline_id=state.pipeline_id)
+        return "halt"
+
     if state.review_passed:
         logger.info("review_passed", pipeline_id=state.pipeline_id)
         return "test"
@@ -51,6 +55,14 @@ def should_retry_test(state: PipelineState) -> str:
 
     Returns: "codegen" to retry, "hitl" to proceed, "halt" to stop.
     """
+    if state.test_requires_hitl or state.test_execution_status == "not_executed":
+        logger.warning(
+            "tests_not_executed_hitl_required",
+            pipeline_id=state.pipeline_id,
+            execution_status=state.test_execution_status,
+        )
+        return "hitl"
+
     if state.tests_passed:
         logger.info("tests_passed", pipeline_id=state.pipeline_id)
         return "hitl"

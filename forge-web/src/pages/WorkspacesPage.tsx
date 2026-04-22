@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Users, Plus, ArrowLeft, Loader2, UserPlus } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
@@ -15,21 +15,24 @@ export default function WorkspacesPage() {
   const [inviting, setInviting] = useState(false);
   const [error, setError] = useState('');
 
-  const fetchWorkspaces = async () => {
-    const res = await authFetch('/api/workspaces');
-    if (res.ok) {
-      const data = await res.json();
-      setWorkspaces(data.workspaces ?? []);
+  const fetchWorkspaces = useCallback(async () => {
+    try {
+      const res = await authFetch('/api/workspaces');
+      if (res.ok) {
+        const data = await res.json();
+        setWorkspaces(data.workspaces ?? []);
+      }
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-  };
+  }, [authFetch]);
 
-  useEffect(() => { fetchWorkspaces(); }, []); // eslint-disable-line
+  useEffect(() => { void fetchWorkspaces(); }, [fetchWorkspaces]);
 
-  const openWorkspace = async (id: string) => {
+  const openWorkspace = useCallback(async (id: string) => {
     const res = await authFetch(`/api/workspaces/${id}`);
     if (res.ok) setSelected(await res.json());
-  };
+  }, [authFetch]);
 
   const createWorkspace = async () => {
     if (!newName.trim()) return;

@@ -11,6 +11,21 @@ import {
 import type { AgentOutput, HITLDecision } from '../types';
 import { useAuth } from '../context/AuthContext';
 
+type HITLIssue = {
+  severity: 'critical' | 'error' | 'warning' | 'info';
+  file: string;
+  line?: number;
+  message: string;
+};
+
+type HITLTestResult = {
+  test_name?: string;
+  name?: string;
+  status: 'passed' | 'failed' | 'skipped' | 'not_executed';
+  error_message?: string;
+  error?: string;
+};
+
 interface HITLGateProps {
   pipelineId: string;
   agents: AgentOutput[];
@@ -18,6 +33,44 @@ interface HITLGateProps {
   onDecision: (decision: HITLDecision) => void;
   /** When true, renders inline (no full-screen overlay). */
   compact?: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isHITLIssue(value: unknown): value is HITLIssue {
+  if (!isRecord(value)) return false;
+  const severity = value.severity;
+  return (
+    (severity === 'critical' || severity === 'error' || severity === 'warning' || severity === 'info') &&
+    typeof value.file === 'string' &&
+    typeof value.message === 'string' &&
+    (value.line === undefined || typeof value.line === 'number')
+  );
+}
+
+function isHITLTestResult(value: unknown): value is HITLTestResult {
+  if (!isRecord(value)) return false;
+  const status = value.status;
+  return (
+    (status === 'passed' || status === 'failed' || status === 'skipped' || status === 'not_executed') &&
+    (value.test_name === undefined || typeof value.test_name === 'string') &&
+    (value.name === undefined || typeof value.name === 'string') &&
+    (value.error_message === undefined || typeof value.error_message === 'string') &&
+    (value.error === undefined || typeof value.error === 'string')
+  );
+}
+
+function outputArray<T>(output: unknown, key: string, guard: (value: unknown) => value is T): T[] {
+  if (Array.isArray(output)) return output.filter(guard);
+  const value = isRecord(output) ? output[key] : undefined;
+  return Array.isArray(value) ? value.filter(guard) : [];
+}
+
+function outputNumber(output: unknown, key: string): number | undefined {
+  const value = isRecord(output) ? output[key] : undefined;
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 export default function HITLGate({ pipelineId, agents, onClose, onDecision, compact: _compact }: HITLGateProps) {
@@ -29,19 +82,25 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
   const reviewAgent = agents.find((a) => a.stage === 'review');
   const testAgent = agents.find((a) => a.stage === 'test');
 
-  const issues = (reviewAgent?.output as any)?.issues ?? [];
-  const tests = (testAgent?.output as any)?.test_results ?? [];
-  const coverage = (testAgent?.output as any)?.coverage_percent;
+  const reviewOutput: unknown = reviewAgent?.output;
+  const testOutput: unknown = testAgent?.output;
+  const directIssues = outputArray(reviewAgent?.review_issues, 'issues', isHITLIssue);
+  const outputIssues = outputArray(reviewOutput, 'issues', isHITLIssue);
+  const issues = directIssues.length > 0 ? directIssues : outputIssues;
+  const directTests = outputArray(testAgent?.test_results, 'test_results', isHITLTestResult);
+  const outputTests = outputArray(testOutput, 'test_results', isHITLTestResult);
+  const tests = directTests.length > 0 ? directTests : outputTests;
+  const coverage = testAgent?.test_coverage ?? outputNumber(testOutput, 'coverage_percent');
 
-  const errorCount = issues.filter((i: any) => i.severity === 'error').length;
-  const warningCount = issues.filter((i: any) => i.severity === 'warning').length;
-  const passedTests = tests.filter((t: any) => t.status === 'passed').length;
-  const failedTests = tests.filter((t: any) => t.status === 'failed').length;
+  const errorCount = issues.filter((i) => i.severity === 'critical' || i.severity === 'error').length;
+  const warningCount = issues.filter((i) => i.severity === 'warning').length;
+  const passedTests = tests.filter((t) => t.status === 'passed').length;
+  const failedTests = tests.filter((t) => t.status === 'failed').length;
 
   const handleSubmit = async (action: HITLDecision['action']) => {
     setSubmitting(true);
     setSubmitError(null);
-    const decisionMap: Record<string, string> = {
+    const decisionMap: Record<HITLDecision['action'], 'approve' | 'reject' | 'modify'> = {
       approve: 'approve',
       reject: 'reject',
       request_changes: 'modify',
@@ -52,7 +111,7 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           pipeline_id: pipelineId,
-          decision: decisionMap[action] || action,
+          decision: decisionMap[action],
           comments: comment || undefined,
         }),
       });
@@ -155,11 +214,11 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
             <div>
               <h3 className="text-sm font-semibold mb-2">Review Issues</h3>
               <ul className="space-y-1.5 max-h-40 overflow-y-auto">
-                {issues.map((issue: any, i: number) => (
+                {issues.map((issue, i) => (
                   <li
                     key={i}
                     className={`text-xs p-2.5 rounded-lg flex items-start gap-2 border ${
-                      issue.severity === 'error'
+                      issue.severity === 'critical' || issue.severity === 'error'
                         ? 'bg-red-500/5 text-red-300 border-red-500/10'
                         : issue.severity === 'warning'
                           ? 'bg-amber-500/5 text-amber-300 border-amber-500/10'
@@ -183,17 +242,17 @@ export default function HITLGate({ pipelineId, agents, onClose, onDecision, comp
               <h3 className="text-sm font-semibold mb-2">Failed Tests</h3>
               <ul className="space-y-1.5 max-h-32 overflow-y-auto">
                 {tests
-                  .filter((t: any) => t.status === 'failed')
-                  .map((test: any, i: number) => (
+                  .filter((t) => t.status === 'failed')
+                  .map((test, i) => (
                     <li
                       key={i}
                       className="text-xs p-2.5 rounded-lg bg-red-500/5 text-red-300 flex items-start gap-2 border border-red-500/10"
                     >
                       <XCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
                       <div>
-                        <span className="font-mono">{test.name}</span>
-                        {test.error && (
-                          <p className="text-red-400/60 mt-0.5">{test.error}</p>
+                        <span className="font-mono">{test.test_name ?? test.name ?? 'Unnamed test'}</span>
+                        {(test.error_message ?? test.error) && (
+                          <p className="text-red-400/60 mt-0.5">{test.error_message ?? test.error}</p>
                         )}
                       </div>
                     </li>

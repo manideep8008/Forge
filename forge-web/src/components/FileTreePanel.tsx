@@ -14,6 +14,36 @@ interface TreeNode {
   isDir: boolean;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isSafeGeneratedFilePath(path: string): boolean {
+  if (!path || path.startsWith('/') || path.includes('\\')) return false;
+  const parts = path.split('/');
+  return parts.every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
+function looksLikeGeneratedFile(path: string): boolean {
+  return path.includes('/') || path.includes('.') || path === 'Dockerfile' || path === 'Makefile';
+}
+
+function getGeneratedFiles(output: unknown): Record<string, string> {
+  if (!isRecord(output)) return {};
+  const candidate = isRecord(output.files) ? output.files : output;
+  const files: Record<string, string> = {};
+  for (const [path, content] of Object.entries(candidate)) {
+    if (
+      typeof content === 'string' &&
+      isSafeGeneratedFilePath(path) &&
+      looksLikeGeneratedFile(path)
+    ) {
+      files[path] = content;
+    }
+  }
+  return files;
+}
+
 function buildTree(files: Record<string, string>): Record<string, TreeNode> {
   const root: Record<string, TreeNode> = {};
   for (const [path, content] of Object.entries(files)) {
@@ -103,7 +133,7 @@ export default function FileTreePanel({ pipeline }: FileTreePanelProps) {
 
   // Extract generated files from the codegen agent output
   const codegenAgent = pipeline?.agents.find((a) => a.agent === 'codegen');
-  const generatedFiles = (codegenAgent?.output as Record<string, string> | undefined) ?? {};
+  const generatedFiles = getGeneratedFiles(codegenAgent?.output);
   const hasFiles = Object.keys(generatedFiles).length > 0;
 
   const tree = hasFiles ? buildTree(generatedFiles) : {};

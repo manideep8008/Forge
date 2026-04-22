@@ -134,19 +134,20 @@ async def delete_template(template_id: str, x_user_id: str | None = Header(None)
 async def create_schedule(body: ScheduleCreate, x_user_id: str | None = Header(None)):
     user_id = _require_user(x_user_id)
     next_run = _next_run(body.cron_expr)
-    db = await get_db()
-    # Verify template exists
-    tmpl = await db.fetchrow("SELECT id FROM pipeline_templates WHERE id=$1", body.template_id)
-    if not tmpl:
-        raise HTTPException(status_code=404, detail="template not found")
-    row = await db.fetchrow(
-        """
-        INSERT INTO scheduled_pipelines (template_id, workspace_id, created_by, cron_expr, next_run_at)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, created_at
-        """,
-        body.template_id, body.workspace_id, user_id, body.cron_expr, next_run,
-    )
+    pool = await get_db()
+    async with pool.acquire() as conn, conn.transaction():
+        # Verify template exists on the same connection as the schedule insert.
+        tmpl = await conn.fetchrow("SELECT id FROM pipeline_templates WHERE id=$1", body.template_id)
+        if not tmpl:
+            raise HTTPException(status_code=404, detail="template not found")
+        row = await conn.fetchrow(
+            """
+            INSERT INTO scheduled_pipelines (template_id, workspace_id, created_by, cron_expr, next_run_at)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, created_at
+            """,
+            body.template_id, body.workspace_id, user_id, body.cron_expr, next_run,
+        )
     return {
         "id": str(row["id"]),
         "template_id": body.template_id,
@@ -209,7 +210,9 @@ async def toggle_schedule(
 async def delete_schedule(schedule_id: str, x_user_id: str | None = Header(None)):
     user_id = _require_user(x_user_id)
     db = await get_db()
-    await db.execute(
+    result = await db.execute(
         "DELETE FROM scheduled_pipelines WHERE id=$1 AND created_by=$2",
         schedule_id, user_id,
     )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="schedule not found")

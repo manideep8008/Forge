@@ -111,7 +111,7 @@ class OllamaClient:
                     if should_retry:
                         await asyncio.sleep(min(retry_base_seconds * (2 ** (attempt - 1)), 8.0))
 
-        raise last_error
+        raise last_error or RuntimeError("Ollama generation failed without an exception")
 
     async def embed(self, text: str, model: str | None = None) -> list[float]:
         """Generate embeddings for text."""

@@ -13,7 +13,7 @@ interface UsePipelineReturn {
   connected: boolean;
   events: PipelineEvent[];
   lastEvent: PipelineEvent | null;
-  refetch: () => void;
+  refetch: (isPolling?: boolean) => Promise<void>;
 }
 
 export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
@@ -21,10 +21,19 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const errorCountRef = useRef(0);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeFetchRef = useRef<AbortController | null>(null);
+  const fetchSequenceRef = useRef(0);
   const { connected, events, lastEvent } = useWebSocket(pipelineId);
   const { authFetch } = useAuth();
 
   const fetchPipeline = useCallback(async (isPolling = false) => {
+    if (isPolling && activeFetchRef.current) return;
+
+    const requestId = ++fetchSequenceRef.current;
+    activeFetchRef.current?.abort();
+    activeFetchRef.current = null;
+
     if (!pipelineId) {
       setPipeline(null);
       setError(null);
@@ -32,13 +41,19 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
       return;
     }
 
+    const controller = new AbortController();
+    activeFetchRef.current = controller;
+
     try {
       if (!isPolling) setLoading(true);
       setError(null);
-      const res = await authFetch(`/api/pipeline/${pipelineId}/status`);
+      const res = await authFetch(`/api/pipeline/${pipelineId}/status`, {
+        signal: controller.signal,
+      });
       if (!res.ok) throw new Error(`Failed to fetch pipeline: ${res.statusText}`);
       errorCountRef.current = 0;
       const raw = await res.json();
+      if (controller.signal.aborted || requestId !== fetchSequenceRef.current) return;
       // Normalize API response to match Pipeline type
       const defaultStages: PipelineStage[] = STAGE_ORDER.map((name: StageName) => ({
         name,
@@ -57,6 +72,7 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
       };
       setPipeline(data);
     } catch (err) {
+      if (controller.signal.aborted || requestId !== fetchSequenceRef.current) return;
       errorCountRef.current += 1;
       setError(err instanceof Error ? err.message : 'Unknown error');
       // Stop polling after 5 consecutive failures to avoid endless noise
@@ -65,11 +81,14 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
         intervalRef.current = null;
       }
     } finally {
-      setLoading(false);
+      if (activeFetchRef.current === controller) {
+        activeFetchRef.current = null;
+      }
+      if (!controller.signal.aborted && requestId === fetchSequenceRef.current) {
+        setLoading(false);
+      }
     }
   }, [pipelineId, authFetch]);
-
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (!pipelineId) {
@@ -77,19 +96,31 @@ export function usePipeline(pipelineId: string | undefined): UsePipelineReturn {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
       }
+      fetchSequenceRef.current += 1;
+      activeFetchRef.current?.abort();
+      activeFetchRef.current = null;
       setPipeline(null);
       setLoading(false);
       setError(null);
       return;
     }
 
+    errorCountRef.current = 0;
+    setPipeline(null);
+    setError(null);
+    setLoading(true);
     void fetchPipeline(false);
     // Poll every 3s while pipeline is active (not completed/failed)
     intervalRef.current = setInterval(() => {
       void fetchPipeline(true);
     }, 3000);
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      activeFetchRef.current?.abort();
+      activeFetchRef.current = null;
     };
   }, [fetchPipeline, pipelineId]);
 

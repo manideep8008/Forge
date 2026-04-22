@@ -217,7 +217,7 @@ export default function PreviewPanel({ pipeline, events = [] }: PreviewPanelProp
               src={deployUrl}
               className="w-full h-full border-0 bg-white"
               title="Live Preview"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+              sandbox="allow-scripts allow-forms allow-popups"
             />
           ) : (
             <div className="h-full flex flex-col items-center justify-center gap-2 text-forge-muted">

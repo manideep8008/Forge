@@ -8,6 +8,7 @@ import structlog
 
 from agents.base import BaseAgent
 from agents.codegen import _extract_json
+from internal_auth import internal_api_headers
 from models.schemas import AgentResult, RetryDecision
 from services.ollama_client import ollama_client
 
@@ -108,6 +109,22 @@ Respond with valid JSON only."""
                 real_passed = real.get("passed", 0)
                 real_failed = real.get("failed", 0)
                 real_total = real.get("total", 0)
+                if real_total == 0:
+                    error = real.get("error") or "Docker test runner produced no executed test results"
+                    return AgentResult(
+                        success=False,
+                        output={
+                            "test_files": test_files,
+                            "test_results": self._mark_not_executed([], test_files),
+                            "coverage_percent": 0.0,
+                            "execution_status": "not_executed",
+                            "requires_hitl": True,
+                            "summary": error,
+                        },
+                        tokens_used=result["tokens_used"],
+                        model_used=result["model"],
+                    )
+
                 # Success = at least one test ran AND none failed
                 real_success = real_total > 0 and real_failed == 0
                 return AgentResult(
@@ -116,6 +133,8 @@ Respond with valid JSON only."""
                         "test_files": test_files,
                         "test_results": real.get("test_results", []),
                         "coverage_percent": real.get("coverage_percent", 0.0),
+                        "execution_status": "executed",
+                        "requires_hitl": False,
                         "summary": (
                             f"{real_passed} passed, "
                             f"{real_failed} failed, "
@@ -127,21 +146,35 @@ Respond with valid JSON only."""
                     model_used=result["model"],
                 )
 
-        # --- Fallback: LLM-simulated results ---
+        # --- Fallback: tests generated, but not executed ---
         simulated_results = test_output.get("test_results", [])
 
         # If no simulated results but we have test files, generate synthetic
-        # "passed" results by parsing test/describe/it names from the code.
+        # results by parsing test/describe/it names from the code.
         if not simulated_results and test_files:
             simulated_results = self._extract_test_names(test_files)
 
+        not_executed_results = self._mark_not_executed(simulated_results, test_files)
+        if test_files:
+            summary = (
+                "Tests were generated but not executed because the Docker "
+                "test runner was unavailable. Human approval is required."
+            )
+        else:
+            summary = (
+                test_output.get("summary")
+                or "Tests were not generated or executed. Human approval is required."
+            )
+
         return AgentResult(
-            success=bool(test_files),
+            success=False,
             output={
                 "test_files": test_files,
-                "test_results": simulated_results,
-                "coverage_percent": test_output.get("coverage_percent", 0.0) or (75.0 if simulated_results else 0.0),
-                "summary": test_output.get("summary", "") + " (simulated)",
+                "test_results": not_executed_results,
+                "coverage_percent": 0.0,
+                "execution_status": "not_executed",
+                "requires_hitl": True,
+                "summary": summary,
             },
             tokens_used=result["tokens_used"],
             model_used=result["model"],
@@ -163,11 +196,46 @@ Respond with valid JSON only."""
                 results.append({
                     "test_name": name,
                     "name": name,
-                    "status": "passed",
-                    "duration_ms": 12,
+                    "status": "not_executed",
+                    "duration_ms": 0,
                     "error_message": None,
                 })
         return results
+
+    @staticmethod
+    def _mark_not_executed(test_results: list[dict], test_files: dict) -> list[dict]:
+        """Convert unverified LLM/synthetic results into not-executed records."""
+        results = []
+        for index, test in enumerate(test_results):
+            name = (
+                test.get("test_name")
+                or test.get("name")
+                or f"generated_test_{index + 1}"
+            )
+            results.append({
+                **test,
+                "test_name": name,
+                "name": name,
+                "status": "not_executed",
+                "duration_ms": 0,
+                "error_message": "not executed: Docker test runner unavailable",
+                "error": "not executed: Docker test runner unavailable",
+            })
+
+        if results or not test_files:
+            return results
+
+        return [
+            {
+                "test_name": f"{path}: not executed",
+                "name": f"{path}: not executed",
+                "status": "not_executed",
+                "duration_ms": 0,
+                "error_message": "not executed: Docker test runner unavailable",
+                "error": "not executed: Docker test runner unavailable",
+            }
+            for path in test_files
+        ]
 
     async def _run_tests_in_container(
         self, pipeline_id: str, generated_files: dict, test_files: dict
@@ -178,6 +246,7 @@ Respond with valid JSON only."""
             async with httpx.AsyncClient(timeout=180) as client:
                 resp = await client.post(
                     f"{docker_svc_url}/docker/test",
+                    headers=internal_api_headers(),
                     json={
                         "pipeline_id": pipeline_id,
                         "generated_files": generated_files,

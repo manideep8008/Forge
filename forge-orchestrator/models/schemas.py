@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PipelineStatus(str, Enum):
@@ -52,8 +52,9 @@ class RetryDecision(str, Enum):
 # === Request/Response Models ===
 
 class PipelineCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     input_text: str = Field(..., min_length=1, max_length=10000)
-    user_id: str = Field(default="default-user")
     repo_url: str | None = None
 
 

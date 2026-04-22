@@ -3,11 +3,13 @@
 import asyncio
 import json
 import os
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
 from agents.base import BaseAgent
 from agents.codegen import _extract_json
+from internal_auth import internal_api_headers
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
@@ -38,9 +40,22 @@ Do NOT wrap the JSON in markdown code fences."""
 
 ERROR_RATE_THRESHOLD = 0.05
 RESPONSE_TIME_THRESHOLD = 5000
+ALLOWED_DEPLOY_URL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 logger = structlog.get_logger()
+
+
+def _trusted_deploy_probe_url(deploy_url: str) -> str | None:
+    try:
+        parsed = urlsplit(deploy_url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+
+    if parsed.scheme != "http" or parsed.hostname not in ALLOWED_DEPLOY_URL_HOSTS or port is None:
+        return None
+    return f"http://host.docker.internal:{port}"
 
 
 class MonitorAgent(BaseAgent):
@@ -120,21 +135,28 @@ Respond with valid JSON only."""
             }
 
         docker_svc_url = os.getenv("DOCKER_SVC_URL", "http://forge-docker-svc:8082")
+        docker_headers = internal_api_headers()
 
         container_name = f"forge-{pipeline_id}"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(f"{docker_svc_url}/docker/health/{container_name}")
+                resp = await client.get(
+                    f"{docker_svc_url}/docker/health/{container_name}",
+                    headers=docker_headers,
+                )
                 if resp.status_code == 200:
                     data = resp.json()
                     # Also try hitting the app directly to confirm it responds
                     if deploy_url:
-                        verify_url = deploy_url.replace("localhost", "host.docker.internal")
+                        verify_url = _trusted_deploy_probe_url(deploy_url)
                         try:
-                            app_resp = await client.get(verify_url, follow_redirects=True, timeout=5)
-                            data["app_reachable"] = app_resp.status_code < 500
-                            if app_resp.status_code < 500:
-                                data["healthy"] = True
+                            if verify_url:
+                                app_resp = await client.get(verify_url, follow_redirects=False, timeout=5)
+                                data["app_reachable"] = app_resp.status_code < 500
+                                if app_resp.status_code < 500:
+                                    data["healthy"] = True
+                            else:
+                                data["app_reachable"] = False
                         except Exception:
                             data["app_reachable"] = False
                     return data

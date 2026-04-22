@@ -2,10 +2,14 @@ package websocket
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v5"
@@ -27,8 +31,31 @@ var upgrader = websocket.Upgrader{
 var (
 	allowedOrigins = loadAllowedOrigins()
 	devMode        = os.Getenv("DEV_MODE") == "true"
-	jwtSecret      = []byte(os.Getenv("JWT_SECRET"))
+
+	maxConnectionsPerPipeline = envInt("WS_MAX_CONNECTIONS_PER_PIPELINE", 8)
+	maxConnectionsPerIP       = envInt("WS_MAX_CONNECTIONS_PER_IP", 32)
 )
+
+const (
+	wsReadLimit = int64(4096)
+	wsWriteWait = 10 * time.Second
+	wsPongWait  = 60 * time.Second
+	wsPingEvery = 54 * time.Second
+)
+
+var errHubClosed = errors.New("websocket hub is shut down")
+
+func envInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
 
 // loadAllowedOrigins parses WS_ALLOWED_ORIGINS (comma-separated) and returns
 // a map for O(1) lookup. If empty and DEV_MODE=false, all origins are denied.
@@ -118,6 +145,7 @@ func ValidateJWT(r *http.Request) (string, error) {
 		return "", nil // Unauthenticated, not an error.
 	}
 
+	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
 	if len(jwtSecret) == 0 {
 		return "", nil // Secret not configured yet; treat as unauthenticated.
 	}
@@ -146,7 +174,15 @@ type client struct {
 	conn       *websocket.Conn
 	send       chan []byte
 	pipelineID string
+	ip         string
 	userID     string // Authenticated user who owns this connection.
+	closeOnce  sync.Once
+}
+
+func (c *client) closeSend() {
+	c.closeOnce.Do(func() {
+		close(c.send)
+	})
 }
 
 // Hub manages WebSocket connections grouped by pipeline_id. For each active
@@ -154,25 +190,35 @@ type client struct {
 // messages out to all connected clients. One subscription per pipeline.
 type Hub struct {
 	rdb        *redis.Client
-	db         *pgxpool.Pool
+	dbProvider func(context.Context) *pgxpool.Pool
 	mu         sync.Mutex
 	clients    map[string]map[*client]struct{} // pipeline_id -> connected clients
-	subs       map[string]context.CancelFunc   // pipeline_id -> cancel for Redis subscription
+	byIP       map[string]int
+	byPipeline map[string]int
+	subs       map[string]context.CancelFunc // pipeline_id -> cancel for Redis subscription
 	register   chan *client
 	unregister chan *client
 	done       chan struct{}
+	doneOnce   sync.Once
 }
 
 // NewHub creates a new WebSocket hub. db may be nil if the database is unavailable.
 func NewHub(rdb *redis.Client, db any) *Hub {
-	var pool *pgxpool.Pool
-	if db != nil {
-		pool, _ = db.(*pgxpool.Pool)
+	var provider func(context.Context) *pgxpool.Pool
+	switch v := db.(type) {
+	case *pgxpool.Pool:
+		provider = func(context.Context) *pgxpool.Pool { return v }
+	case func() *pgxpool.Pool:
+		provider = func(context.Context) *pgxpool.Pool { return v() }
+	case func(context.Context) *pgxpool.Pool:
+		provider = v
 	}
 	return &Hub{
 		rdb:        rdb,
-		db:         pool,
+		dbProvider: provider,
 		clients:    make(map[string]map[*client]struct{}),
+		byIP:       make(map[string]int),
+		byPipeline: make(map[string]int),
 		subs:       make(map[string]context.CancelFunc),
 		register:   make(chan *client, 64),
 		unregister: make(chan *client, 64),
@@ -204,7 +250,8 @@ func (h *Hub) Run() {
 			if pipelineClients, ok := h.clients[c.pipelineID]; ok {
 				if _, exists := pipelineClients[c]; exists {
 					delete(pipelineClients, c)
-					close(c.send)
+					c.closeSend()
+					h.releaseConnectionLocked(c)
 				}
 
 				if len(pipelineClients) == 0 {
@@ -223,11 +270,13 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			for pid, pipelineClients := range h.clients {
 				for c := range pipelineClients {
-					close(c.send)
+					c.closeSend()
 					c.conn.Close()
 				}
 				delete(h.clients, pid)
 			}
+			h.byIP = make(map[string]int)
+			h.byPipeline = make(map[string]int)
 			for pid, cancel := range h.subs {
 				cancel()
 				delete(h.subs, pid)
@@ -240,7 +289,9 @@ func (h *Hub) Run() {
 
 // Shutdown stops the hub.
 func (h *Hub) Shutdown() {
-	close(h.done)
+	h.doneOnce.Do(func() {
+		close(h.done)
+	})
 }
 
 // ServeWS upgrades an HTTP connection to WebSocket and registers the client.
@@ -254,25 +305,42 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Authenticate — JWT is optional for now to get things running.
-	// TODO: Re-enforce auth require once frontend passes tokens
-	userID, _ := ValidateJWT(r)
+	userID, err := ValidateJWT(r)
+	if err != nil || userID == "" {
+		http.Error(w, `{"error":"invalid or missing token"}`, http.StatusUnauthorized)
+		return
+	}
 
-	// 2. Ownership check — skip if not authenticated yet
-	if h.db != nil && userID != "" {
-		owner, err := h.checkPipelineOwner(r.Context(), pipelineID)
-		if err != nil {
-			http.Error(w, `{"error":"pipeline not found"}`, http.StatusNotFound)
-			return
+	db := h.pool(r.Context())
+	if db == nil {
+		log.Error().Msg("database unavailable for websocket ownership check")
+		http.Error(w, `{"error":"service unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	owner, err := h.checkPipelineOwner(r.Context(), db, pipelineID)
+	if err != nil {
+		http.Error(w, `{"error":"pipeline not found"}`, http.StatusNotFound)
+		return
+	}
+	if owner != userID {
+		http.Error(w, `{"error":"access denied"}`, http.StatusForbidden)
+		return
+	}
+
+	clientIP := remoteIP(r)
+	if err := h.reserveConnection(pipelineID, clientIP); err != nil {
+		status := http.StatusTooManyRequests
+		if errors.Is(err, errHubClosed) {
+			status = http.StatusServiceUnavailable
 		}
-		if owner != userID {
-			http.Error(w, `{"error":"access denied"}`, http.StatusForbidden)
-			return
-		}
+		http.Error(w, `{"error":"too many websocket connections"}`, status)
+		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		h.releaseConnection(&client{pipelineID: pipelineID, ip: clientIP})
 		log.Error().Err(err).Msg("websocket upgrade failed")
 		return
 	}
@@ -281,10 +349,17 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		conn:       conn,
 		send:       make(chan []byte, 256),
 		pipelineID: pipelineID,
+		ip:         clientIP,
 		userID:     userID,
 	}
 
-	h.register <- c
+	select {
+	case h.register <- c:
+	case <-h.done:
+		h.releaseConnection(c)
+		c.conn.Close()
+		return
+	}
 
 	// Writer goroutine: send messages from the channel to the WS connection.
 	go h.writePump(c)
@@ -292,11 +367,18 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	go h.readPump(c)
 }
 
+func (h *Hub) pool(ctx context.Context) *pgxpool.Pool {
+	if h.dbProvider == nil {
+		return nil
+	}
+	return h.dbProvider(ctx)
+}
+
 // checkPipelineOwner queries the database to verify who owns a pipeline.
 // Returns the user_id of the owner, or an error if the pipeline doesn't exist.
-func (h *Hub) checkPipelineOwner(ctx context.Context, pipelineID string) (string, error) {
+func (h *Hub) checkPipelineOwner(ctx context.Context, db *pgxpool.Pool, pipelineID string) (string, error) {
 	var owner string
-	err := h.db.QueryRow(ctx,
+	err := db.QueryRow(ctx,
 		"SELECT user_id FROM pipelines WHERE id = $1",
 		pipelineID,
 	).Scan(&owner)
@@ -341,16 +423,105 @@ func (h *Hub) subscribeRedis(ctx context.Context, pipelineID string) {
 	}
 }
 
+func remoteIP(r *http.Request) string {
+	remote := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		return host
+	}
+	if remote != "" {
+		return remote
+	}
+	return "unknown"
+}
+
+func (h *Hub) reserveConnection(pipelineID, ip string) error {
+	select {
+	case <-h.done:
+		return errHubClosed
+	default:
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if maxConnectionsPerPipeline > 0 && h.byPipeline[pipelineID] >= maxConnectionsPerPipeline {
+		return errors.New("pipeline websocket connection cap reached")
+	}
+	if maxConnectionsPerIP > 0 && h.byIP[ip] >= maxConnectionsPerIP {
+		return errors.New("ip websocket connection cap reached")
+	}
+
+	h.byPipeline[pipelineID]++
+	h.byIP[ip]++
+	return nil
+}
+
+func (h *Hub) releaseConnection(c *client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.releaseConnectionLocked(c)
+}
+
+func (h *Hub) releaseConnectionLocked(c *client) {
+	if c.pipelineID != "" && h.byPipeline[c.pipelineID] > 0 {
+		h.byPipeline[c.pipelineID]--
+		if h.byPipeline[c.pipelineID] == 0 {
+			delete(h.byPipeline, c.pipelineID)
+		}
+	}
+	if c.ip != "" && h.byIP[c.ip] > 0 {
+		h.byIP[c.ip]--
+		if h.byIP[c.ip] == 0 {
+			delete(h.byIP, c.ip)
+		}
+	}
+}
+
+func (h *Hub) unregisterClient(c *client) {
+	select {
+	case <-h.done:
+		return
+	default:
+	}
+	select {
+	case h.unregister <- c:
+	case <-h.done:
+	}
+}
+
 // writePump sends messages from the send channel to the WebSocket connection.
 func (h *Hub) writePump(c *client) {
+	ticker := time.NewTicker(wsPingEvery)
 	defer func() {
-		h.unregister <- c
+		ticker.Stop()
+		h.unregisterClient(c)
 		c.conn.Close()
 	}()
-	for msg := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			log.Debug().Err(err).Str("pipeline_id", c.pipelineID).Msg("ws write error")
-			return
+
+	for {
+		select {
+		case msg, ok := <-c.send:
+			if err := c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait)); err != nil {
+				log.Debug().Err(err).Str("pipeline_id", c.pipelineID).Msg("ws write deadline error")
+				return
+			}
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Debug().Err(err).Str("pipeline_id", c.pipelineID).Msg("ws write error")
+				return
+			}
+		case <-ticker.C:
+			if err := c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait)); err != nil {
+				log.Debug().Err(err).Str("pipeline_id", c.pipelineID).Msg("ws ping deadline error")
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Debug().Err(err).Str("pipeline_id", c.pipelineID).Msg("ws ping error")
+				return
+			}
 		}
 	}
 }
@@ -358,8 +529,13 @@ func (h *Hub) writePump(c *client) {
 // readPump reads from the WebSocket to detect client disconnect.
 func (h *Hub) readPump(c *client) {
 	defer func() {
-		h.unregister <- c
+		h.unregisterClient(c)
 	}()
+	c.conn.SetReadLimit(wsReadLimit)
+	_ = c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
 	for {
 		if _, _, err := c.conn.ReadMessage(); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {

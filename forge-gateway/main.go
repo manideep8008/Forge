@@ -46,9 +46,12 @@ func main() {
 	if os.Getenv("JWT_SECRET") == "" {
 		log.Fatal().Msg("JWT_SECRET environment variable is not set — this is required in production")
 	}
+	if os.Getenv("INTERNAL_API_KEY") == "" {
+		log.Fatal().Msg("INTERNAL_API_KEY environment variable is not set — internal services require shared-secret authentication")
+	}
 
 	// ── WebSocket hub ───────────────────────────────────────────────
-	hub := wshub.NewHub(rdb, database.Pool())
+	hub := wshub.NewHub(rdb, database.PoolContext)
 	go hub.Run()
 
 	// ── Router ──────────────────────────────────────────────────────
@@ -57,6 +60,7 @@ func main() {
 	// Global middleware chain (applied to all routes).
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Recoverer)
+	r.Use(middleware.SecurityHeaders)
 	r.Use(middleware.CORSMiddleware)
 	r.Use(middleware.CorrelationID)
 

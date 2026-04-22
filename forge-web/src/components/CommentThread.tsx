@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { MessageSquare, Send, Loader2, X } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import type { PipelineComment } from '../types/collaboration';
@@ -9,43 +9,64 @@ interface CommentThreadProps {
   onClose: () => void;
 }
 
+async function readError(res: Response, fallback: string): Promise<string> {
+  const data = await res.json().catch(() => ({})) as { detail?: string; error?: string };
+  return data.detail ?? data.error ?? fallback;
+}
+
 export default function CommentThread({ pipelineId, stageName, onClose }: CommentThreadProps) {
   const { authFetch, user } = useAuth();
   const [comments, setComments] = useState<PipelineComment[]>([]);
   const [body, setBody] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [error, setError] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  const fetchComments = async () => {
-    const res = await authFetch(`/api/pipeline/${pipelineId}/comments`);
-    if (res.ok) {
+  const fetchComments = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await authFetch(`/api/pipeline/${pipelineId}/comments`);
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to load comments'));
+      }
       const data = await res.json();
       setComments(data.comments ?? []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load comments');
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-  };
+  }, [authFetch, pipelineId]);
 
-  useEffect(() => { fetchComments(); }, [pipelineId]); // eslint-disable-line
+  useEffect(() => { void fetchComments(); }, [fetchComments]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [comments]);
 
   const send = async () => {
-    if (!body.trim()) return;
+    if (!body.trim() || sending) return;
     setSending(true);
-    const res = await authFetch(`/api/pipeline/${pipelineId}/comments`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ body: body.trim(), stage_name: stageName }),
-    });
-    if (res.ok) {
+    setError('');
+    try {
+      const res = await authFetch(`/api/pipeline/${pipelineId}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: body.trim(), stage_name: stageName }),
+      });
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to send comment'));
+      }
       const c = await res.json() as PipelineComment & { author_email?: string };
       setComments(prev => [...prev, { ...c, author_email: c.author_email ?? user?.email ?? '' }]);
       setBody('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to send comment');
+    } finally {
+      setSending(false);
     }
-    setSending(false);
   };
 
   return (
@@ -112,6 +133,7 @@ export default function CommentThread({ pipelineId, stageName, onClose }: Commen
             {sending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
           </button>
         </div>
+        {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
       </div>
     </div>
   );

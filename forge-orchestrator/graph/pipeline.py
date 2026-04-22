@@ -8,7 +8,7 @@ from graph.state import PipelineState
 from graph.feedback import should_retry_review, should_retry_test
 from agents.requirements import RequirementsAgent
 from agents.architect import ArchitectAgent
-from agents.codegen import CodegenAgent
+from agents.codegen import CodegenAgent, validate_generated_files
 from agents.review import ReviewAgent
 from agents.test_agent import TestAgent
 from agents.cicd import CICDAgent
@@ -141,17 +141,22 @@ async def codegen_node(state: PipelineState) -> dict:
         new_files = result.output.get("files", {})
         # In modification mode: merge existing files with changed files
         # (LLM returns only the files that changed; unchanged files survive)
-        merged_files = {**state.existing_files, **new_files} if state.modification_request else new_files
+        merged_files = (
+            {**validate_generated_files(state.existing_files), **new_files}
+            if state.modification_request
+            else new_files
+        )
         await context_manager.set_many(state.pipeline_id, {
             "generated_files": merged_files,
             "git_branch": result.output.get("branch", ""),
         })
-        file_names = list(merged_files.keys())[:8]
+        file_names = sorted(merged_files.keys())
         await context_manager.publish_event(state.pipeline_id, "agent.codegen.completed", {
-            **result.output,
             "message": f"Generated {len(merged_files)} files",
             "file_count": len(merged_files),
             "file_names": file_names,
+            "branch": result.output.get("branch", ""),
+            "commit_message": result.output.get("commit_message", ""),
             "tokens_used": result.tokens_used,
         })
     else:
@@ -183,6 +188,20 @@ async def review_node(state: PipelineState) -> dict:
         "spec": state.spec,
     }
     result = await review_agent.run(context)
+    if not result.success:
+        error = result.error or "Review agent failed"
+        await context_manager.publish_event(state.pipeline_id, "stage_failed", {
+            "stage": "review", "message": f"Review failed: {error}",
+        })
+        return {
+            "review_issues": [],
+            "review_passed": False,
+            "current_stage": "failed",
+            "error": error,
+            "total_tokens": state.total_tokens + result.tokens_used,
+            "stage_status": {**state.stage_status, "review": "failed"},
+        }
+
     issues = result.output.get("issues", [])
     passed = not any(i.get("severity") == "critical" for i in issues)
     critical = sum(1 for i in issues if i.get("severity") == "critical")
@@ -221,17 +240,34 @@ async def test_node(state: PipelineState) -> dict:
     }
     result = await test_agent.run(context)
     tests = result.output.get("test_results", [])
-    # Empty test results = pytest couldn't run = don't block, proceed to HITL
-    passed = all(t.get("status") == "passed" for t in tests) if tests else True
+    execution_status = result.output.get(
+        "execution_status",
+        "executed" if tests else "not_executed",
+    )
+    requires_hitl = bool(result.output.get("requires_hitl"))
+    # Empty test results = pytest couldn't run = don't block, proceed to HITL.
+    # Explicit not_executed results require HITL without treating tests as passed.
+    passed = (
+        False
+        if execution_status == "not_executed" or not result.success
+        else (all(t.get("status") == "passed" for t in tests) if tests else True)
+    )
     coverage = result.output.get("coverage_percent", 0.0)
     passed_count = sum(1 for t in tests if t.get("status") == "passed")
     failed_count = sum(1 for t in tests if t.get("status") == "failed")
-    msg = f"{passed_count}/{len(tests)} tests passed" if tests else "No tests to run"
+    if execution_status == "not_executed":
+        msg = result.output.get("summary") or "Tests not executed; human approval required"
+    elif not result.success and not tests:
+        msg = result.output.get("summary") or "No tests were executed"
+    else:
+        msg = f"{passed_count}/{len(tests)} tests passed" if tests else "No tests to run"
     if coverage:
         msg += f", {coverage:.0f}% coverage"
     await context_manager.publish_event(state.pipeline_id, "agent.test.completed", {
         "passed": passed, "coverage": coverage,
         "total_tests": len(tests), "passed_count": passed_count, "failed_count": failed_count,
+        "execution_status": execution_status,
+        "requires_hitl": requires_hitl,
         "message": msg,
         "tokens_used": result.tokens_used,
     })
@@ -239,6 +275,8 @@ async def test_node(state: PipelineState) -> dict:
         "test_results": tests,
         "tests_passed": passed,
         "coverage_percent": coverage,
+        "test_execution_status": execution_status,
+        "test_requires_hitl": requires_hitl,
         "test_iteration": state.test_iteration + 1,
         "current_stage": "test",
         "total_tokens": state.total_tokens + result.tokens_used,
@@ -259,6 +297,8 @@ async def hitl_node(state: PipelineState) -> dict:
         "review_issues": state.review_issues,
         "test_results": state.test_results,
         "coverage_percent": state.coverage_percent,
+        "test_execution_status": state.test_execution_status,
+        "test_requires_hitl": state.test_requires_hitl,
     })
 
     logger.info("hitl_waiting", pipeline_id=state.pipeline_id)

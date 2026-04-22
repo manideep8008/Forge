@@ -48,7 +48,7 @@ class ContextManager:
         """Set a single field in pipeline context."""
         r = await self._get_redis()
         key = self._key(pipeline_id)
-        serialized = json.dumps(value) if not isinstance(value, str) else value
+        serialized = json.dumps(value)
         await r.hset(key, field, serialized)
         await r.expire(key, CONTEXT_TTL)
 
@@ -68,10 +68,7 @@ class ContextManager:
         """Set multiple fields in pipeline context."""
         r = await self._get_redis()
         key = self._key(pipeline_id)
-        serialized = {
-            k: json.dumps(v) if not isinstance(v, str) else v
-            for k, v in data.items()
-        }
+        serialized = {k: json.dumps(v) for k, v in data.items()}
         await r.hset(key, mapping=serialized)
         await r.expire(key, CONTEXT_TTL)
 
@@ -113,6 +110,22 @@ class ContextManager:
         channel = f"ws:{pipeline_id}"
         await pubsub.subscribe(channel)
 
+        async def _cleanup_pubsub() -> None:
+            await pubsub.unsubscribe(channel)
+            await pubsub.close()
+
+        def _log_cleanup_result(task: asyncio.Task) -> None:
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError as cancel_err:
+                exc = cancel_err
+            if exc:
+                logger.warning(
+                    "pubsub_cleanup_failed",
+                    pipeline_id=pipeline_id,
+                    error=str(exc),
+                )
+
         deadline = asyncio.get_running_loop().time() + timeout
         try:
             while asyncio.get_running_loop().time() < deadline:
@@ -136,8 +149,12 @@ class ContextManager:
                 except asyncio.TimeoutError:
                     pass  # Fall through to re-check the field.
         finally:
-            await pubsub.unsubscribe(channel)
-            await pubsub.close()
+            cleanup_task = asyncio.create_task(_cleanup_pubsub())
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cleanup_task.add_done_callback(_log_cleanup_result)
+                raise
 
         # Final check after timeout.
         current = await self.get(pipeline_id, field)

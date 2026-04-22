@@ -1,8 +1,13 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { BookTemplate, Plus, Play, Trash2, ArrowLeft, Loader2, Globe, Lock } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import type { PipelineTemplate } from '../types/collaboration';
+
+async function readError(res: Response, fallback: string): Promise<string> {
+  const data = await res.json().catch(() => ({})) as { detail?: string; error?: string };
+  return data.detail ?? data.error ?? fallback;
+}
 
 export default function TemplatesPage() {
   const { authFetch, user } = useAuth();
@@ -12,49 +17,74 @@ export default function TemplatesPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({ name: '', prompt: '', description: '', is_public: false });
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
-  const fetchTemplates = async () => {
-    const res = await authFetch('/api/templates');
-    if (res.ok) {
-      const data = await res.json();
-      setTemplates(data.templates ?? []);
+  const fetchTemplates = useCallback(async () => {
+    try {
+      const res = await authFetch('/api/templates');
+      if (res.ok) {
+        const data = await res.json();
+        setTemplates(data.templates ?? []);
+      }
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-  };
+  }, [authFetch]);
 
-  useEffect(() => { fetchTemplates(); }, []); // eslint-disable-line
+  useEffect(() => { void fetchTemplates(); }, [fetchTemplates]);
 
   const createTemplate = async () => {
-    if (!form.name.trim() || !form.prompt.trim()) return;
+    if (!form.name.trim() || !form.prompt.trim() || saving) return;
     setSaving(true);
-    const res = await authFetch('/api/templates', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(form),
-    });
-    if (res.ok) {
+    setError('');
+    try {
+      const res = await authFetch('/api/templates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      });
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to create template'));
+      }
       setForm({ name: '', prompt: '', description: '', is_public: false });
       setShowCreate(false);
       await fetchTemplates();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create template');
+    } finally {
+      setSaving(false);
     }
-    setSaving(false);
   };
 
   const deleteTemplate = async (id: string) => {
-    await authFetch(`/api/templates/${id}`, { method: 'DELETE' });
-    setTemplates(t => t.filter(x => x.id !== id));
+    setError('');
+    try {
+      const res = await authFetch(`/api/templates/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to delete template'));
+      }
+      setTemplates(t => t.filter(x => x.id !== id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete template');
+    }
   };
 
   const launchTemplate = async (prompt: string) => {
-    const res = await authFetch('/api/pipeline', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input_text: prompt }),
-    });
-    if (res.ok) {
+    setError('');
+    try {
+      const res = await authFetch('/api/pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input_text: prompt }),
+      });
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to launch template'));
+      }
       const data = await res.json();
       const id = data.pipeline_id ?? data.id;
       if (id) navigate(`/pipeline/${id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to launch template');
     }
   };
 
@@ -78,6 +108,7 @@ export default function TemplatesPage() {
             New template
           </button>
         </div>
+        {error && <p className="mb-4 text-xs text-red-400">{error}</p>}
 
         {/* Create form */}
         {showCreate && (

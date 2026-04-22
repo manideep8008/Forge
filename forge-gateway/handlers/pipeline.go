@@ -30,7 +30,12 @@ func validatePipelineID(w http.ResponseWriter, id string) bool {
 
 var orchestratorURL = envOrDefault("ORCHESTRATOR_URL", "http://forge-orchestrator:8090")
 
-const maxCreatePipelineBodyBytes = 1 << 20
+const (
+	maxCreatePipelineBodyBytes = 1 << 20
+	maxPipelineActionBodyBytes = 1 << 20
+	maxProxyBodyBytes          = 1 << 20
+	maxRelayResponseBodyBytes  = 32 << 20
+)
 
 // ---------- request / response types ----------
 
@@ -90,11 +95,15 @@ func CreatePipeline(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-marshal with normalized fields for the orchestrator.
-	userID := middleware.GetUserID(r)
-	normalized, _ := json.Marshal(map[string]string{
+	// Omit user_id from the body since the orchestrator's Pydantic model forbids extra fields
+	// and extracts the user ID from the X-User-ID header instead.
+	payload := map[string]string{
 		"input_text": req.Prompt,
-		"user_id":    userID,
-	})
+	}
+	if req.RepoURL != "" {
+		payload["repo_url"] = req.RepoURL
+	}
+	normalized, _ := json.Marshal(payload)
 
 	// Forward to orchestrator.
 	url := fmt.Sprintf("%s/pipeline", orchestratorURL)
@@ -157,12 +166,10 @@ func ApprovePipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		jsonError(w, "failed to read request body", http.StatusBadRequest)
+	body, ok := readLimitedRequestBody(w, r, maxPipelineActionBodyBytes)
+	if !ok {
 		return
 	}
-	defer r.Body.Close()
 
 	url := fmt.Sprintf("%s/pipeline/%s/approve", orchestratorURL, id)
 	resp, err := proxyPost(url, body, r)
@@ -265,12 +272,10 @@ func ModifyPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		jsonError(w, "failed to read request body", http.StatusBadRequest)
+	body, ok := readLimitedRequestBody(w, r, maxPipelineActionBodyBytes)
+	if !ok {
 		return
 	}
-	defer r.Body.Close()
 
 	url := fmt.Sprintf("%s/pipeline/%s/modify", orchestratorURL, id)
 	resp, err := proxyPost(url, body, r)
@@ -332,14 +337,51 @@ func propagateHeaders(from, to *http.Request) {
 	if uid := middleware.GetUserID(from); uid != "anonymous" {
 		to.Header.Set("X-User-ID", uid)
 	}
+	addInternalAuth(to)
 }
 
 func relayResponse(w http.ResponseWriter, resp *http.Response) {
-	w.Header().Set("Content-Type", "application/json")
+	if resp.ContentLength > maxRelayResponseBodyBytes {
+		jsonError(w, "orchestrator response too large", http.StatusBadGateway)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRelayResponseBodyBytes+1))
+	if err != nil {
+		log.Error().Err(err).Int("status_code", resp.StatusCode).Msg("failed to read orchestrator response")
+		jsonError(w, "failed to read orchestrator response", http.StatusBadGateway)
+		return
+	}
+	if int64(len(body)) > maxRelayResponseBodyBytes {
+		jsonError(w, "orchestrator response too large", http.StatusBadGateway)
+		return
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	if _, err := w.Write(body); err != nil {
 		log.Error().Err(err).Int("status_code", resp.StatusCode).Msg("failed to relay orchestrator response")
 	}
+}
+
+func readLimitedRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	body, err := io.ReadAll(r.Body)
+	defer r.Body.Close()
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			jsonError(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return nil, false
+		}
+		jsonError(w, "failed to read request body", http.StatusBadRequest)
+		return nil, false
+	}
+	return body, true
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {

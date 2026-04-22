@@ -1,9 +1,11 @@
 """Workspace and membership endpoints."""
 from __future__ import annotations
 
+from typing import Annotated
+
 import structlog
-from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Header, HTTPException, Query
+from pydantic import BaseModel, StringConstraints
 
 from db import get_db
 
@@ -13,8 +15,11 @@ router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
 # ── Request models ─────────────────────────────────────────────────────────────
 
+WorkspaceName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+
+
 class WorkspaceCreate(BaseModel):
-    name: str
+    name: WorkspaceName
 
 
 class InviteMember(BaseModel):
@@ -46,17 +51,19 @@ async def create_workspace(
     x_user_id: str | None = Header(None),
 ):
     user_id = _require_user(x_user_id)
-    db = await get_db()
-    row = await db.fetchrow(
-        "INSERT INTO workspaces (name, owner_id) VALUES ($1, $2) RETURNING id, name, created_at",
-        body.name, user_id,
-    )
+    pool = await get_db()
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "INSERT INTO workspaces (name, owner_id) VALUES ($1, $2) RETURNING id, name, created_at",
+            body.name, user_id,
+        )
+        ws_id = str(row["id"])
+        # Auto-add owner as member
+        await conn.execute(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            ws_id, user_id,
+        )
     ws_id = str(row["id"])
-    # Auto-add owner as member
-    await db.execute(
-        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
-        ws_id, user_id,
-    )
     return {"id": ws_id, "name": row["name"], "created_at": row["created_at"].isoformat()}
 
 
@@ -148,7 +155,7 @@ async def invite_member(
 @router.get("/{workspace_id}/pipelines")
 async def list_workspace_pipelines(
     workspace_id: str,
-    limit: int = 20,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
     x_user_id: str | None = Header(None),
 ):
     user_id = _require_user(x_user_id)

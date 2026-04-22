@@ -31,7 +31,8 @@ func RateLimiter(rdb *redis.Client) func(http.Handler) http.Handler {
 			// Determine bucket and limit.
 			limit := queryLimit
 			bucket := "query"
-			if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/pipeline") {
+			failClosed := !isReadOnlyMethod(r.Method)
+			if failClosed && isPipelineRoute(r.URL.Path) {
 				limit = pipelineLimit
 				bucket = "pipeline"
 			}
@@ -42,8 +43,19 @@ func RateLimiter(rdb *redis.Client) func(http.Handler) http.Handler {
 			ctx := r.Context()
 			count, err := rdb.Incr(ctx, key).Result()
 			if err != nil {
-				// If Redis is down, allow the request but log a warning.
-				log.Warn().Err(err).Msg("rate limiter: redis unavailable, allowing request")
+				log.Warn().
+					Err(err).
+					Bool("fail_closed", failClosed).
+					Str("method", r.Method).
+					Str("path", r.URL.Path).
+					Msg("rate limiter: redis unavailable")
+				if failClosed {
+					w.Header().Set("Retry-After", "10")
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					fmt.Fprint(w, `{"error":"rate limiter unavailable"}`)
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -67,6 +79,14 @@ func RateLimiter(rdb *redis.Client) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func isReadOnlyMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+}
+
+func isPipelineRoute(path string) bool {
+	return path == "/api/pipeline" || strings.HasPrefix(path, "/api/pipeline/")
 }
 
 func envInt(key string, fallback int) int {
@@ -106,8 +126,9 @@ func resolvedClientIP(r *http.Request, trusted map[string]bool) string {
 		remoteAddr = host
 	}
 
-	// If the direct connection is not from a trusted proxy, use RemoteAddr.
-	if trusted != nil && !trusted[remoteAddr] {
+	// If no proxies are trusted, or the direct connection is not from a trusted
+	// proxy, use RemoteAddr.
+	if trusted == nil || !trusted[remoteAddr] {
 		return remoteAddr
 	}
 

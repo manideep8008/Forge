@@ -9,6 +9,9 @@ from agents.codegen import _extract_json
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
+MAX_REVIEW_CODE_CHARS = 60_000
+TRUNCATION_NOTICE = "\n...[truncated for review prompt size limit]\n"
+
 SYSTEM_PROMPT = """You are a pragmatic code reviewer for full-stack web applications (React + Vite + Tailwind CSS frontend, Node.js Express backend).
 Review the provided code and identify ONLY issues that would cause bugs or break functionality.
 
@@ -59,14 +62,37 @@ class ReviewAgent(BaseAgent):
     async def validate(self, context: dict) -> bool:
         return bool(context.get("generated_files"))
 
+    def _build_files_text(self, files: dict, max_chars: int = MAX_REVIEW_CODE_CHARS) -> tuple[str, bool]:
+        chunks: list[str] = []
+        remaining = max_chars
+
+        for path, content in files.items():
+            header = f"\n--- {path} ---\n"
+            body = str(content)
+            chunk = f"{header}{body}\n"
+
+            if len(chunk) <= remaining:
+                chunks.append(chunk)
+                remaining -= len(chunk)
+                continue
+
+            if remaining > len(header) + len(TRUNCATION_NOTICE):
+                body_budget = remaining - len(header) - len(TRUNCATION_NOTICE)
+                chunks.append(f"{header}{body[:body_budget]}{TRUNCATION_NOTICE}")
+            return "".join(chunks), True
+
+        return "".join(chunks), False
+
     async def execute(self, context: dict) -> AgentResult:
         files = context["generated_files"]
         spec = context.get("spec", {})
 
         # Build code review prompt
-        files_text = ""
-        for path, content in files.items():
-            files_text += f"\n--- {path} ---\n{content}\n"
+        files_text, truncated = self._build_files_text(files)
+        truncation_note = (
+            "\nNOTE: Code input was truncated to stay within the review prompt size limit.\n"
+            if truncated else ""
+        )
 
         prompt = f"""Review the following code against the specification:
 
@@ -75,6 +101,7 @@ SPECIFICATION:
 
 CODE TO REVIEW:
 {files_text}
+{truncation_note}
 
 Identify issues by severity. Respond with valid JSON only."""
 
@@ -97,7 +124,7 @@ Identify issues by severity. Respond with valid JSON only."""
         )
 
         return AgentResult(
-            success=bool(review.get("summary") or issues),
+            success=True,
             output={"issues": issues, "summary": review.get("summary", ""), "passed": passed},
             tokens_used=result["tokens_used"],
             model_used=result["model"],

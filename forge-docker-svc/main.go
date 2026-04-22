@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -78,6 +80,18 @@ type HealthResponse struct {
 type CleanupResponse struct {
 	Removed int    `json:"removed"`
 	Message string `json:"message"`
+}
+
+const (
+	internalAPIKeyHeader  = "X-Internal-API-Key"
+	workspaceContextRoot  = "/workspace"
+	contentSecurityPolicy = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+)
+
+var dockerTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+
+func previewHealthcheckCommand(port string) string {
+	return fmt.Sprintf("wget -qO- http://127.0.0.1:%s/health || wget -qO- http://127.0.0.1:%s/ || exit 1", port, port)
 }
 
 // ---------------------------------------------------------------------------
@@ -157,10 +171,28 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pipelineID, err := normalizePipelineID(req.PipelineID)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "pipeline_id must be a valid UUID")
+		return
+	}
+	req.PipelineID = pipelineID
+
 	imageTag := fmt.Sprintf("forge-%s:latest", req.PipelineID)
 	if req.Tag != "" {
+		if err := validateForgeImageTag(req.PipelineID, req.Tag); err != nil {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		imageTag = req.Tag
 	}
+
+	contextPath, err := cleanWorkspaceContextPath(req.ContextPath)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.ContextPath = contextPath
 
 	buildID := uuid.New().String()
 	s.log.Info().
@@ -236,6 +268,18 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pipelineID, err := normalizePipelineID(req.PipelineID)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "pipeline_id must be a valid UUID")
+		return
+	}
+	req.PipelineID = pipelineID
+
+	if err := validateForgeImageTag(req.PipelineID, req.Image); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	ctx := r.Context()
 	containerName := fmt.Sprintf("forge-%s", req.PipelineID)
 
@@ -264,7 +308,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 			"forge.managed":     "true",
 		},
 		Healthcheck: &container.HealthConfig{
-			Test:     []string{"CMD-SHELL", fmt.Sprintf("wget -qO- http://localhost:%s/health || wget -qO- http://localhost:%s/ || exit 1", req.Port, req.Port)},
+			Test:     []string{"CMD-SHELL", previewHealthcheckCommand(req.Port)},
 			Interval: 10 * time.Second,
 			Timeout:  5 * time.Second,
 			Retries:  3,
@@ -322,6 +366,18 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pipelineID, err := normalizePipelineID(req.PipelineID)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "pipeline_id must be a valid UUID")
+		return
+	}
+	req.PipelineID = pipelineID
+
+	if err := validateForgeImageTag(req.PipelineID, req.PreviousImage); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	ctx := r.Context()
 	containerName := fmt.Sprintf("forge-%s", req.PipelineID)
 
@@ -354,7 +410,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 			"forge.rollback":    "true",
 		},
 		Healthcheck: &container.HealthConfig{
-			Test:     []string{"CMD-SHELL", fmt.Sprintf("wget -qO- http://localhost:%s/health || wget -qO- http://localhost:%s/ || exit 1", port, port)},
+			Test:     []string{"CMD-SHELL", previewHealthcheckCommand(port)},
 			Interval: 10 * time.Second,
 			Timeout:  5 * time.Second,
 			Retries:  3,
@@ -512,6 +568,12 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "pipeline id is required")
 		return
 	}
+	normalizedPipelineID, err := normalizePipelineID(pipelineID)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "pipeline id must be a valid UUID")
+		return
+	}
+	pipelineID = normalizedPipelineID
 
 	ctx := r.Context()
 	s.log.Info().Str("pipeline_id", pipelineID).Msg("cleaning up containers and images")
@@ -587,17 +649,85 @@ func (s *Server) writeError(w http.ResponseWriter, status int, msg string) {
 	s.writeJSON(w, status, map[string]string{"error": msg})
 }
 
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func normalizePipelineID(pipelineID string) (string, error) {
+	parsed, err := uuid.Parse(strings.TrimSpace(pipelineID))
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}
+
+func validateForgeImageTag(pipelineID, imageName string) error {
+	normalizedPipelineID, err := normalizePipelineID(pipelineID)
+	if err != nil {
+		return fmt.Errorf("pipeline_id must be a valid UUID")
+	}
+
+	expectedPrefix := fmt.Sprintf("forge-%s:", normalizedPipelineID)
+	imageName = strings.TrimSpace(imageName)
+	if !strings.HasPrefix(imageName, expectedPrefix) {
+		return fmt.Errorf("image must match %s*", expectedPrefix)
+	}
+
+	tag := strings.TrimPrefix(imageName, expectedPrefix)
+	if !dockerTagPattern.MatchString(tag) {
+		return fmt.Errorf("image tag must be a valid local Docker tag")
+	}
+
+	return nil
+}
+
+func requireInternalAPIKey(expected string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			provided := r.Header.Get(internalAPIKeyHeader)
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "internal service authentication required",
+				})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func cleanWorkspaceContextPath(contextPath string) (string, error) {
+	clean := filepath.Clean(contextPath)
+	if !strings.HasPrefix(clean+"/", workspaceContextRoot+"/") {
+		return "", fmt.Errorf("context_path must be under %s", workspaceContextRoot)
+	}
+	return clean, nil
+}
+
 // createTar builds an in-memory tar archive of the given directory.
 func createTar(dir string) (*bytes.Buffer, error) {
+	cleanDir, err := cleanWorkspaceContextPath(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	buf := new(bytes.Buffer)
 	tw := tar.NewWriter(buf)
 	defer tw.Close()
 
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(cleanDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(dir, path)
+		rel, err := filepath.Rel(cleanDir, path)
 		if err != nil {
 			return err
 		}
@@ -778,7 +908,9 @@ func testRunnerImageAndCmd(lang string) (string, string) {
 				"if [ ! -d node_modules ]; then " +
 				"ln -s /opt/forge-cache/node_modules node_modules 2>/dev/null || true; " +
 				"fi; " +
-				"npm install --prefer-offline --silent 2>/dev/null; " +
+				"if [ ! -L node_modules ]; then " +
+				"npm install --offline --prefer-offline --ignore-scripts --no-audit --fund=false --silent 2>/dev/null || true; " +
+				"fi; " +
 				// Run tests with vitest (pre-cached), or jest if found.
 				"if [ -f node_modules/.bin/vitest ] || [ -f /opt/forge-cache/node_modules/.bin/vitest ]; then " +
 				"npx vitest run --reporter=json 2>&1 | tee /tmp/vitest.json; " +
@@ -1068,6 +1200,12 @@ func (s *Server) handleRunTests(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "pipeline_id is required")
 		return
 	}
+	pipelineID, err := normalizePipelineID(req.PipelineID)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "pipeline_id must be a valid UUID")
+		return
+	}
+	req.PipelineID = pipelineID
 
 	// Merge generated + test files
 	allFiles := make(map[string]string, len(req.GeneratedFiles)+len(req.TestFiles))
@@ -1116,7 +1254,7 @@ func (s *Server) handleRunTests(w http.ResponseWriter, r *http.Request) {
 		Cmd:        []string{"sh", "-c", testCmd},
 		WorkingDir: "/app",
 	}, &container.HostConfig{
-		NetworkMode: "bridge",
+		NetworkMode: "none",
 		Resources:   container.Resources{Memory: 1024 * 1024 * 1024, NanoCPUs: 2_000_000_000},
 	}, nil, nil, cName)
 	if err != nil {
@@ -1140,6 +1278,7 @@ func (s *Server) handleRunTests(w http.ResponseWriter, r *http.Request) {
 	// Wait with timeout
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer waitCancel()
+	timedOut := false
 	statusC, errC := s.docker.ContainerWait(waitCtx, created.ID, container.WaitConditionNotRunning)
 	select {
 	case res := <-statusC:
@@ -1147,6 +1286,7 @@ func (s *Server) handleRunTests(w http.ResponseWriter, r *http.Request) {
 	case err := <-errC:
 		s.log.Warn().Err(err).Str("pipeline_id", req.PipelineID).Msg("test container wait error")
 	case <-waitCtx.Done():
+		timedOut = true
 		s.log.Warn().Str("pipeline_id", req.PipelineID).Msg("test execution timed out")
 		s.docker.ContainerStop(context.Background(), created.ID, container.StopOptions{})
 	}
@@ -1165,6 +1305,10 @@ func (s *Server) handleRunTests(w http.ResponseWriter, r *http.Request) {
 	resp := parseTestOutput(rawOutput, lang)
 	resp.Language = lang
 	resp.RawOutput = rawOutput
+	if timedOut && resp.Total == 0 {
+		resp.Success = false
+		resp.Error = "test execution timed out before producing results"
+	}
 
 	s.log.Info().
 		Str("pipeline_id", req.PipelineID).
@@ -1182,6 +1326,12 @@ func (s *Server) handleRunTests(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func main() {
+	internalAPIKey := os.Getenv("INTERNAL_API_KEY")
+	if internalAPIKey == "" {
+		fmt.Fprintln(os.Stderr, "fatal: INTERNAL_API_KEY environment variable is not set — refusing to start")
+		os.Exit(1)
+	}
+
 	srv, err := NewServer()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
@@ -1194,6 +1344,8 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(securityHeaders)
+	r.Use(requireInternalAPIKey(internalAPIKey))
 
 	// Health
 	r.Get("/health", srv.handleHealth)

@@ -51,6 +51,8 @@ class PipelineState(BaseModel):
     test_results: list[dict[str, Any]] = Field(default_factory=list)
     tests_passed: bool = False
     coverage_percent: float = 0.0
+    test_execution_status: str = ""
+    test_requires_hitl: bool = False
 
     # Feedback loop tracking
     review_iteration: int = 0

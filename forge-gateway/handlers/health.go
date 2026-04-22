@@ -102,6 +102,7 @@ func httpHealthCheck(baseURL string) func(context.Context) error {
 		if err != nil {
 			return err
 		}
+		addInternalAuth(req)
 		client := &http.Client{Timeout: 3 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {

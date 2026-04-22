@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -38,10 +41,16 @@ type loginRequest struct {
 }
 
 type tokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int    `json:"expires_in"`
-	TokenType    string `json:"token_type"`
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int    `json:"expires_in"`
+	TokenType   string `json:"token_type"`
+}
+
+type issuedTokenPair struct {
+	accessToken         string
+	refreshToken        string
+	refreshTokenID      string
+	refreshTokenExpires time.Time
 }
 
 // ---------- helpers ----------
@@ -59,15 +68,66 @@ func init() {
 }
 
 const (
-	accessTokenTTL  = 15 * time.Minute
-	refreshTokenTTL = 7 * 24 * time.Hour
+	accessTokenTTL         = 15 * time.Minute
+	refreshTokenTTL        = 7 * 24 * time.Hour
+	refreshTokenCookie     = "refresh_token"
+	refreshTokenCookiePath = "/auth"
 )
+
+var rotateRefreshTokenScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if not current or current ~= ARGV[1] then
+	return 0
+end
+redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
+redis.call("DEL", KEYS[1])
+return 1
+`)
 
 func jwtSecret() []byte {
 	return []byte(os.Getenv("JWT_SECRET"))
 }
 
-func (h *AuthHandler) issueTokenPair(w http.ResponseWriter, r *http.Request, userID, email string) {
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func setRefreshTokenCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     refreshTokenCookie,
+		Value:    token,
+		Path:     refreshTokenCookiePath,
+		Expires:  expires,
+		MaxAge:   int(refreshTokenTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   !strings.EqualFold(os.Getenv("DEV_MODE"), "true"),
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func clearRefreshTokenCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     refreshTokenCookie,
+		Value:    "",
+		Path:     refreshTokenCookiePath,
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   !strings.EqualFold(os.Getenv("DEV_MODE"), "true"),
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func refreshTokenFromCookie(r *http.Request) (string, bool) {
+	cookie, err := r.Cookie(refreshTokenCookie)
+	if err != nil || cookie.Value == "" {
+		return "", false
+	}
+	return cookie.Value, true
+}
+
+func newTokenPair(userID, email string) (issuedTokenPair, error) {
 	now := time.Now()
 	secret := jwtSecret()
 
@@ -80,8 +140,7 @@ func (h *AuthHandler) issueTokenPair(w http.ResponseWriter, r *http.Request, use
 	}
 	accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(secret)
 	if err != nil {
-		jsonError(w, "internal error", http.StatusInternalServerError)
-		return
+		return issuedTokenPair{}, err
 	}
 
 	// Refresh token
@@ -94,20 +153,56 @@ func (h *AuthHandler) issueTokenPair(w http.ResponseWriter, r *http.Request, use
 	}
 	refreshToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(secret)
 	if err != nil {
+		return issuedTokenPair{}, err
+	}
+
+	return issuedTokenPair{
+		accessToken:         accessToken,
+		refreshToken:        refreshToken,
+		refreshTokenID:      jti,
+		refreshTokenExpires: now.Add(refreshTokenTTL),
+	}, nil
+}
+
+func writeTokenPairResponse(w http.ResponseWriter, pair issuedTokenPair) {
+	setRefreshTokenCookie(w, pair.refreshToken, pair.refreshTokenExpires)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tokenResponse{
+		AccessToken: pair.accessToken,
+		ExpiresIn:   int(accessTokenTTL.Seconds()),
+		TokenType:   "Bearer",
+	})
+}
+
+func (h *AuthHandler) issueTokenPair(w http.ResponseWriter, r *http.Request, userID, email string) bool {
+	pair, err := newTokenPair(userID, email)
+	if err != nil {
 		jsonError(w, "internal error", http.StatusInternalServerError)
-		return
+		return false
 	}
 
 	// Persist refresh token ID in Redis so we can revoke it.
-	h.rdb.Set(r.Context(), "refresh:"+jti, userID, refreshTokenTTL)
+	if err := h.rdb.Set(r.Context(), "refresh:"+pair.refreshTokenID, userID, refreshTokenTTL).Err(); err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return false
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tokenResponse{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresIn:    int(accessTokenTTL.Seconds()),
-		TokenType:    "Bearer",
-	})
+	writeTokenPairResponse(w, pair)
+	return true
+}
+
+func (h *AuthHandler) rotateRefreshToken(r *http.Request, oldJTI, newJTI, userID string) (bool, error) {
+	status, err := rotateRefreshTokenScript.Run(
+		r.Context(),
+		h.rdb,
+		[]string{"refresh:" + oldJTI, "refresh:" + newJTI},
+		userID,
+		refreshTokenTTL.Milliseconds(),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return status == 1, nil
 }
 
 // ---------- handlers ----------
@@ -135,7 +230,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pool := database.Pool()
+	pool := database.PoolContext(r.Context())
 	if pool == nil {
 		jsonError(w, "database unavailable", http.StatusServiceUnavailable)
 		return
@@ -147,7 +242,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		req.Email, string(hash),
 	).Scan(&userID)
 	if err != nil {
-		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+		if isUniqueViolation(err) {
 			jsonError(w, "email already registered", http.StatusConflict)
 			return
 		}
@@ -176,7 +271,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pool := database.Pool()
+	pool := database.PoolContext(r.Context())
 	if pool == nil {
 		jsonError(w, "database unavailable", http.StatusServiceUnavailable)
 		return
@@ -199,72 +294,89 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.issueTokenPair(w, r, userID, req.Email)
+	if !h.issueTokenPair(w, r, userID, req.Email) {
+		return
+	}
 }
 
 // Refresh handles POST /auth/refresh — issues a new access token using a valid refresh token.
 func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		RefreshToken string `json:"refresh_token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.RefreshToken == "" {
+	refreshToken, ok := refreshTokenFromCookie(r)
+	if !ok {
 		jsonError(w, "refresh_token is required", http.StatusBadRequest)
 		return
 	}
 
-	token, err := jwt.Parse(body.RefreshToken, func(t *jwt.Token) (interface{}, error) {
+	token, err := jwt.Parse(refreshToken, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, jwt.ErrSignatureInvalid
 		}
 		return jwtSecret(), nil
 	})
 	if err != nil || !token.Valid {
+		clearRefreshTokenCookie(w)
 		jsonError(w, "invalid or expired refresh token", http.StatusUnauthorized)
 		return
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
+		clearRefreshTokenCookie(w)
 		jsonError(w, "invalid token claims", http.StatusUnauthorized)
 		return
 	}
 	jti, _ := claims["jti"].(string)
 	userID, _ := claims["user_id"].(string)
 	if jti == "" || userID == "" {
+		clearRefreshTokenCookie(w)
 		jsonError(w, "invalid token claims", http.StatusUnauthorized)
 		return
 	}
 
-	// Verify refresh token is still live in Redis.
-	storedUserID, err := h.rdb.Get(r.Context(), "refresh:"+jti).Result()
-	if err != nil || storedUserID != userID {
+	// Fetch email for new claims.
+	pool := database.PoolContext(r.Context())
+	var email string
+	if pool == nil {
+		jsonError(w, "database unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := pool.QueryRow(r.Context(), "SELECT email FROM users WHERE id = $1", userID).Scan(&email); err != nil {
+		clearRefreshTokenCookie(w)
+		if errors.Is(err, pgx.ErrNoRows) {
+			jsonError(w, "invalid or expired refresh token", http.StatusUnauthorized)
+			return
+		}
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	pair, err := newTokenPair(userID, email)
+	if err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Atomically consume the old refresh token and persist the replacement.
+	rotated, err := h.rotateRefreshToken(r, jti, pair.refreshTokenID, userID)
+	if err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !rotated {
+		// A duplicate refresh request can lose the rotation race after a newer
+		// response has already set a valid cookie. Do not clear that newer cookie.
 		jsonError(w, "refresh token revoked or expired", http.StatusUnauthorized)
 		return
 	}
 
-	// Fetch email for new claims.
-	pool := database.Pool()
-	var email string
-	if pool != nil {
-		pool.QueryRow(r.Context(), "SELECT email FROM users WHERE id = $1", userID).Scan(&email) //nolint
-	}
-
-	// Issue NEW token pair FIRST, then revoke old token.
-	// This prevents lockout if token issuance succeeds but revocation fails.
-	h.issueTokenPair(w, r, userID, email)
-
-	// Now revoke the old token (best-effort; non-fatal if it fails).
-	h.rdb.Del(r.Context(), "refresh:"+jti)
+	writeTokenPairResponse(w, pair)
 }
 
 // Logout handles POST /auth/logout — revokes the refresh token.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		RefreshToken string `json:"refresh_token"`
-	}
-	// Best-effort: if we can't decode or the token is already gone, still return 204.
-	if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.RefreshToken != "" {
-		token, err := jwt.Parse(body.RefreshToken, func(t *jwt.Token) (interface{}, error) {
+	// Best-effort: if the cookie is already gone or invalid, still clear it and return 204.
+	if refreshToken, ok := refreshTokenFromCookie(r); ok {
+		token, err := jwt.Parse(refreshToken, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, jwt.ErrSignatureInvalid
 			}
@@ -278,5 +390,6 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	clearRefreshTokenCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }

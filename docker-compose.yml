@@ -3,7 +3,7 @@ services:
   forge-redis:
     image: redis:7-alpine
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes
@@ -16,7 +16,7 @@ services:
   forge-postgres:
     image: postgres:16-alpine
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-forge}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Must be set — no default}======
@@ -33,7 +33,7 @@ services:
   forge-chroma:
     image: chromadb/chroma:latest
     ports:
-      - "${CHROMA_PORT:-8000}:8000"
+      - "127.0.0.1:${CHROMA_PORT:-8000}:8000"
     volumes:
       - chroma-data:/chroma/chroma
     environment:
@@ -44,11 +44,10 @@ services:
     build:
       context: ./forge-orchestrator
       dockerfile: Dockerfile
-    ports:
-      - "${ORCHESTRATOR_PORT:-8090}:8090"
     environment:
       REDIS_URL: redis://forge-redis:6379
       POSTGRES_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:?Must be set}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Must be set — no default}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       CHROMA_HOST: forge-chroma
       CHROMA_PORT: 8000
@@ -78,13 +77,14 @@ services:
       context: ./forge-gateway
       dockerfile: Dockerfile
     ports:
-      - "${GATEWAY_PORT:-8080}:8080"
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
     environment:
       REDIS_URL: redis://forge-redis:6379
       POSTGRES_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:?Must be set}@forge-postgres:5432/${POSTGRES_DB:-forge}
       ORCHESTRATOR_URL: http://forge-orchestrator:8090
       GIT_SVC_URL: http://forge-git-svc:8081
       DOCKER_SVC_URL: http://forge-docker-svc:8082
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Must be set — no default}
       JWT_SECRET: ${JWT_SECRET:?Must be set — no default}
       RATE_LIMIT_PIPELINE: ${RATE_LIMIT_PIPELINE:-10}
       RATE_LIMIT_QUERY: ${RATE_LIMIT_QUERY:-100}
@@ -116,12 +116,11 @@ services:
     build:
       context: ./forge-git-svc
       dockerfile: Dockerfile
-    ports:
-      - "${GIT_SVC_PORT:-8081}:8081"
     environment:
       REDIS_URL: redis://forge-redis:6379
       # Go main.go reads REDIS_ADDR as host:port (not a full URL)
       REDIS_ADDR: forge-redis:6379
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Must be set — no default}
     depends_on:
       forge-redis:
         condition: service_healthy
@@ -130,21 +129,44 @@ services:
     volumes:
       - workspace:/workspace
 
+  # Restricted Docker API proxy (Tecnativa). Only this container touches the
+  # host Docker socket; forge-docker-svc reaches the daemon over TCP through
+  # an allowlisted subset of endpoints. Keeps the C3/C4 fix intact while
+  # letting build/deploy/exec work.
+  forge-docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3
+    environment:
+      # Allowlist: only what docker-svc actually needs.
+      CONTAINERS: 1
+      IMAGES: 1
+      BUILD: 1
+      EXEC: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      INFO: 1
+      VERSION: 1
+      POST: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
   forge-docker-svc:
     build:
       context: ./forge-docker-svc
       dockerfile: Dockerfile
-    ports:
-      - "${DOCKER_SVC_PORT:-8082}:8082"
     environment:
       REDIS_URL: redis://forge-redis:6379
       REDIS_ADDR: forge-redis:6379
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Must be set — no default}
+      # Talk to the daemon via the restricted proxy, never the raw socket.
+      DOCKER_HOST: ${DOCKER_HOST:-tcp://forge-docker-proxy:2375}
     depends_on:
       forge-redis:
         condition: service_healthy
+      forge-docker-proxy:
+        condition: service_started
     volumes:
       - workspace:/workspace
-      - /var/run/docker.sock:/var/run/docker.sock
 
   # === Frontend ===
   forge-ui:
@@ -152,7 +174,7 @@ services:
       context: ./forge-web
       dockerfile: Dockerfile
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
     environment:
       VITE_API_URL: http://forge-gateway:8080
     depends_on:

@@ -1,8 +1,13 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Clock, Plus, Trash2, ArrowLeft, Loader2, ToggleLeft, ToggleRight } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import type { ScheduledPipeline, PipelineTemplate } from '../types/collaboration';
+
+async function readError(res: Response, fallback: string): Promise<string> {
+  const data = await res.json().catch(() => ({})) as { detail?: string; error?: string };
+  return data.detail ?? data.error ?? fallback;
+}
 
 export default function SchedulesPage() {
   const { authFetch } = useAuth();
@@ -14,46 +19,68 @@ export default function SchedulesPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
-  const fetchAll = async () => {
-    const [sRes, tRes] = await Promise.all([
-      authFetch('/api/schedules'),
-      authFetch('/api/templates'),
-    ]);
-    if (sRes.ok) setSchedules((await sRes.json()).schedules ?? []);
-    if (tRes.ok) setTemplates((await tRes.json()).templates ?? []);
-    setLoading(false);
-  };
+  const fetchAll = useCallback(async () => {
+    try {
+      const [sRes, tRes] = await Promise.all([
+        authFetch('/api/schedules'),
+        authFetch('/api/templates'),
+      ]);
+      if (sRes.ok) setSchedules((await sRes.json()).schedules ?? []);
+      if (tRes.ok) setTemplates((await tRes.json()).templates ?? []);
+    } finally {
+      setLoading(false);
+    }
+  }, [authFetch]);
 
-  useEffect(() => { fetchAll(); }, []); // eslint-disable-line
+  useEffect(() => { void fetchAll(); }, [fetchAll]);
 
   const createSchedule = async () => {
-    if (!form.template_id || !form.cron_expr.trim()) return;
+    if (!form.template_id || !form.cron_expr.trim() || saving) return;
     setSaving(true);
     setError('');
-    const res = await authFetch('/api/schedules', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(form),
-    });
-    if (res.ok) {
+    try {
+      const res = await authFetch('/api/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      });
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to create schedule'));
+      }
       setForm({ template_id: '', cron_expr: '0 9 * * 1' });
       setShowCreate(false);
       await fetchAll();
-    } else {
-      const data = await res.json().catch(() => ({})) as { detail?: string };
-      setError(data.detail ?? 'Failed to create schedule');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create schedule');
+    } finally {
+      setSaving(false);
     }
-    setSaving(false);
   };
 
   const toggleSchedule = async (id: string, enabled: boolean) => {
-    const res = await authFetch(`/api/schedules/${id}?enabled=${!enabled}`, { method: 'PATCH' });
-    if (res.ok) setSchedules(s => s.map(x => x.id === id ? { ...x, enabled: !enabled } : x));
+    setError('');
+    try {
+      const res = await authFetch(`/api/schedules/${id}?enabled=${!enabled}`, { method: 'PATCH' });
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to update schedule'));
+      }
+      setSchedules(s => s.map(x => x.id === id ? { ...x, enabled: !enabled } : x));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update schedule');
+    }
   };
 
   const deleteSchedule = async (id: string) => {
-    await authFetch(`/api/schedules/${id}`, { method: 'DELETE' });
-    setSchedules(s => s.filter(x => x.id !== id));
+    setError('');
+    try {
+      const res = await authFetch(`/api/schedules/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        throw new Error(await readError(res, 'Failed to delete schedule'));
+      }
+      setSchedules(s => s.filter(x => x.id !== id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete schedule');
+    }
   };
 
   const PRESETS = [
@@ -83,6 +110,7 @@ export default function SchedulesPage() {
             New schedule
           </button>
         </div>
+        {error && <p className="mb-4 text-xs text-red-400">{error}</p>}
 
         {/* Create form */}
         {showCreate && (
@@ -123,7 +151,6 @@ export default function SchedulesPage() {
                   ))}
                 </div>
               </div>
-              {error && <p className="text-xs text-red-400">{error}</p>}
               <div className="flex justify-end gap-2">
                 <button onClick={() => setShowCreate(false)} className="px-3 py-1.5 text-xs text-forge-muted hover:text-white transition-colors">Cancel</button>
                 <button

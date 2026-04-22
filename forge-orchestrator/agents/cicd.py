@@ -10,15 +10,37 @@ import hashlib
 import json
 import os
 import re as _re
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
 from agents.base import BaseAgent
 from agents.codegen import _extract_json
+from internal_auth import internal_api_headers
 from models.schemas import AgentResult
 from services.ollama_client import ollama_client
 
 logger = structlog.get_logger()
+
+ALLOWED_DEPLOY_URL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+NPM_INSTALL_COMMAND = "RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi"
+
+
+def _trusted_deploy_probe_url(deploy_url: str, expected_port: str) -> str | None:
+    """Validate docker-svc's deploy URL before using it in an HTTP client."""
+    try:
+        parsed = urlsplit(deploy_url)
+        expected = int(expected_port)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+
+    if parsed.scheme != "http" or parsed.hostname not in ALLOWED_DEPLOY_URL_HOSTS:
+        return None
+    if port != expected:
+        return None
+
+    return f"http://host.docker.internal:{port}"
 
 # ---------------------------------------------------------------------------
 # Port fixes for LLM-generated Node.js code
@@ -340,7 +362,7 @@ server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port
         "",
         f"# Install client dependencies and build frontend",
         f"WORKDIR /app/{client_dir}",
-        "RUN npm install || true",
+        NPM_INSTALL_COMMAND,
     ]
 
     if has_build:
@@ -354,7 +376,7 @@ server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port
             "",
             f"# Install server dependencies",
             f"WORKDIR /app/{server_dir}",
-            "RUN npm install || true",
+            NPM_INSTALL_COMMAND,
         ])
 
     lines.extend([
@@ -364,7 +386,7 @@ server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port
         "ENV NODE_ENV=production",
         f"EXPOSE {target_port}",
         "",
-        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://localhost:{target_port}/health || exit 1',
+        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://127.0.0.1:{target_port}/health || exit 1',
         "",
         "# Serve the built frontend (with SPA routing + health checks)",
         'CMD ["node", "_static_server.cjs"]',
@@ -427,7 +449,7 @@ def _generate_dockerfile_node(files: dict, context_path: str, target_port: str) 
         "",
         "# Install dependencies first (better layer caching)",
         "COPY package*.json ./",
-        "RUN npm install --workspaces || true",
+        NPM_INSTALL_COMMAND,
         "",
         "# Copy application code",
         "COPY . .",
@@ -437,7 +459,7 @@ def _generate_dockerfile_node(files: dict, context_path: str, target_port: str) 
         f"EXPOSE {target_port}",
         "",
         "# Health check",
-        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://localhost:{target_port}/health || wget -qO- http://localhost:{target_port}/ || exit 1',
+        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://127.0.0.1:{target_port}/health || wget -qO- http://127.0.0.1:{target_port}/ || exit 1',
         "",
     ]
 
@@ -539,7 +561,7 @@ server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port
         "",
         "# Install ALL dependencies (including devDeps for build tools)",
         "COPY package*.json ./",
-        "RUN npm install --workspaces || true",
+        NPM_INSTALL_COMMAND,
         "",
         "# Copy application code",
         "COPY . .",
@@ -563,7 +585,7 @@ server.listen(PORT, '0.0.0.0', () => console.log(`Serving ${{staticDir}} on port
         f"ENV NODE_ENV=production",
         f"EXPOSE {target_port}",
         "",
-        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://localhost:{target_port}/health || wget -qO- http://localhost:{target_port}/ || exit 1',
+        f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://127.0.0.1:{target_port}/health || wget -qO- http://127.0.0.1:{target_port}/ || exit 1',
         "",
         "# Serve with built-in static server (handles SPA routing + health checks)",
         'CMD ["node", "_static_server.cjs"]',
@@ -752,11 +774,12 @@ class CICDAgent(BaseAgent):
 
         # Build and deploy via Docker service
         docker_svc_url = os.getenv("DOCKER_SVC_URL", "http://forge-docker-svc:8082")
+        docker_headers = internal_api_headers()
         image_tag = f"forge-{pipeline_id}:latest"
         deploy_data = {}
         docker_error = None
 
-        await self._cleanup_port(docker_svc_url, target_port)
+        await self._cleanup_port(docker_svc_url, target_port, docker_headers)
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -765,6 +788,7 @@ class CICDAgent(BaseAgent):
                 async with httpx.AsyncClient(timeout=180) as client:
                     build_resp = await client.post(
                         f"{docker_svc_url}/docker/build",
+                        headers=docker_headers,
                         json={"pipeline_id": pipeline_id, "tag": image_tag, "context_path": context_path},
                     )
                     if build_resp.status_code != 200:
@@ -772,6 +796,7 @@ class CICDAgent(BaseAgent):
                     else:
                         deploy_resp = await client.post(
                             f"{docker_svc_url}/docker/deploy",
+                            headers=docker_headers,
                             json={"pipeline_id": pipeline_id, "image": image_tag, "port": target_port},
                         )
                         if deploy_resp.status_code != 200:
@@ -788,7 +813,10 @@ class CICDAgent(BaseAgent):
                 # Clean up failed container
                 try:
                     async with httpx.AsyncClient(timeout=10) as client:
-                        await client.delete(f"{docker_svc_url}/docker/cleanup/{pipeline_id}")
+                        await client.delete(
+                            f"{docker_svc_url}/docker/cleanup/{pipeline_id}",
+                            headers=docker_headers,
+                        )
                 except Exception:
                     pass
                 continue
@@ -798,18 +826,28 @@ class CICDAgent(BaseAgent):
             # may need time for npm install, compilation, etc.
             if docker_error is None:
                 deploy_url = deploy_data.get("url", "")
-                verify_url = deploy_url.replace("localhost", "host.docker.internal") if deploy_url else ""
+                verify_url = _trusted_deploy_probe_url(deploy_url, target_port) if deploy_url else ""
+                if deploy_url and not verify_url:
+                    logger.warning("untrusted_deploy_url_ignored", pipeline_id=pipeline_id, deploy_url=deploy_url)
                 container_ok = False
                 for health_check in range(6):
                     await asyncio.sleep(5 + health_check * 3)
-                    container_ok = await self._verify_container(docker_svc_url, f"forge-{pipeline_id}", verify_url)
+                    container_ok = await self._verify_container(
+                        docker_svc_url,
+                        f"forge-{pipeline_id}",
+                        docker_headers,
+                        verify_url,
+                    )
                     if container_ok:
                         break
                 if not container_ok and attempt < max_attempts:
                     logger.warning("container_unhealthy_retrying", pipeline_id=pipeline_id, attempt=attempt)
                     try:
                         async with httpx.AsyncClient(timeout=10) as client:
-                            await client.delete(f"{docker_svc_url}/docker/cleanup/{pipeline_id}")
+                            await client.delete(
+                                f"{docker_svc_url}/docker/cleanup/{pipeline_id}",
+                                headers=docker_headers,
+                            )
                     except Exception:
                         pass
                     continue
@@ -881,18 +919,27 @@ class CICDAgent(BaseAgent):
             f.write(df)
         logger.info("dockerfile_auto_fixed", error_hint=error_lower[:100])
 
-    async def _verify_container(self, docker_svc_url: str, container_name: str, deploy_url: str = "") -> bool:
+    async def _verify_container(
+        self,
+        docker_svc_url: str,
+        container_name: str,
+        docker_headers: dict[str, str],
+        deploy_url: str = "",
+    ) -> bool:
         """Check if the deployed container is still running after a few seconds."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(f"{docker_svc_url}/docker/health/{container_name}")
+                resp = await client.get(
+                    f"{docker_svc_url}/docker/health/{container_name}",
+                    headers=docker_headers,
+                )
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get("healthy", False) or data.get("running", False):
                         return True
                 if deploy_url:
                     try:
-                        app_resp = await client.get(deploy_url, follow_redirects=True)
+                        app_resp = await client.get(deploy_url, follow_redirects=False)
                         if app_resp.status_code < 500:
                             return True
                     except Exception:
@@ -901,11 +948,11 @@ class CICDAgent(BaseAgent):
             pass
         return False
 
-    async def _cleanup_port(self, docker_svc_url: str, port: str) -> None:
+    async def _cleanup_port(self, docker_svc_url: str, port: str, docker_headers: dict[str, str]) -> None:
         """Stop and remove any existing forge-managed containers using the given host port."""
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(f"{docker_svc_url}/docker/list")
+                resp = await client.get(f"{docker_svc_url}/docker/list", headers=docker_headers)
                 if resp.status_code != 200:
                     return
                 containers = resp.json().get("containers", [])
@@ -914,7 +961,10 @@ class CICDAgent(BaseAgent):
                     pid = c.get("pipeline_id", "")
                     if str(host_port) == str(port) and pid:
                         logger.info("cleanup_port_conflict", pipeline_id=pid, port=port)
-                        await client.delete(f"{docker_svc_url}/docker/cleanup/{pid}")
+                        await client.delete(
+                            f"{docker_svc_url}/docker/cleanup/{pid}",
+                            headers=docker_headers,
+                        )
                         return
         except Exception as exc:
             logger.debug("cleanup_port_skipped", error=str(exc))

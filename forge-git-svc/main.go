@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -22,16 +24,24 @@ import (
 )
 
 const (
-	workspaceDir = "/workspace"
-	redisStream  = "agent.events"
+	workspaceDir          = "/workspace"
+	redisStream           = "agent.events"
+	internalAPIKeyHeader  = "X-Internal-API-Key"
+	contentSecurityPolicy = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 )
 
 var rdb *redis.Client
+var safeGitRefParamPattern = regexp.MustCompile(`^[a-zA-Z0-9._/-]{1,100}$`)
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).
 		With().Timestamp().Caller().Logger()
+
+	internalAPIKey := os.Getenv("INTERNAL_API_KEY")
+	if internalAPIKey == "" {
+		log.Fatal().Msg("INTERNAL_API_KEY environment variable is not set — refusing to start")
+	}
 
 	redisAddr := envOrDefault("REDIS_ADDR", "redis:6379")
 	rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
@@ -48,6 +58,8 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(securityHeaders)
+	r.Use(requireInternalAPIKey(internalAPIKey))
 	r.Use(requestLogger)
 
 	r.Get("/health", healthHandler)
@@ -111,11 +123,19 @@ func createBranchHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "pipeline_id and slug are required")
 		return
 	}
+	if !isSafeGitRefParam(req.PipelineID) {
+		writeError(w, http.StatusBadRequest, "invalid pipeline_id")
+		return
+	}
+	if !isSafeGitRefParam(req.Slug) {
+		writeError(w, http.StatusBadRequest, "invalid slug")
+		return
+	}
 
 	branch := fmt.Sprintf("feat/%s-%s", req.PipelineID, req.Slug)
 	log.Info().Str("pipeline_id", req.PipelineID).Str("branch", branch).Msg("creating branch")
 
-	if out, err := gitExec("checkout", "-b", branch); err != nil {
+	if out, err := gitExec("checkout", "-b", branch, "--"); err != nil {
 		log.Error().Err(err).Str("output", out).Msg("git checkout -b failed")
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("git error: %s", out))
 		return
@@ -150,25 +170,69 @@ func commitHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info().Str("pipeline_id", req.PipelineID).Int("file_count", len(req.Files)).Msg("committing files")
 
 	// Write files to workspace (with path traversal protection)
-	realWorkspace, _ := filepath.EvalSymlinks(workspaceDir)
+	realWorkspace, err := filepath.EvalSymlinks(workspaceDir)
+	if err != nil {
+		log.Error().Err(err).Str("path", workspaceDir).Msg("failed to resolve workspace")
+		writeError(w, http.StatusInternalServerError, "workspace unavailable")
+		return
+	}
+	realWorkspace = filepath.Clean(realWorkspace)
+	pathSeparator := string(os.PathSeparator)
+	workspacePrefix := realWorkspace + pathSeparator
+
 	for relPath, content := range req.Files {
-		absPath := filepath.Join(workspaceDir, relPath)
-		realPath, _ := filepath.EvalSymlinks(filepath.Dir(absPath))
-		if realPath == "" {
-			realPath = filepath.Clean(absPath)
+		cleanAbs, err := filepath.Abs(filepath.Join(realWorkspace, relPath))
+		if err != nil {
+			log.Warn().Err(err).Str("path", relPath).Msg("invalid file path")
+			writeError(w, http.StatusBadRequest, "invalid file path")
+			return
 		}
-		if !strings.HasPrefix(filepath.Clean(absPath), realWorkspace) {
+		cleanAbs = filepath.Clean(cleanAbs)
+		if !strings.HasPrefix(cleanAbs+pathSeparator, workspacePrefix) {
 			log.Warn().Str("path", relPath).Msg("path traversal blocked")
 			writeError(w, http.StatusBadRequest, "invalid file path")
 			return
 		}
-		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-			log.Error().Err(err).Str("path", absPath).Msg("failed to create directory")
+
+		existingParent := filepath.Dir(cleanAbs)
+		for {
+			if _, err := os.Lstat(existingParent); err == nil {
+				break
+			} else if os.IsNotExist(err) {
+				parent := filepath.Dir(existingParent)
+				if parent == existingParent {
+					log.Warn().Str("path", relPath).Msg("path traversal blocked")
+					writeError(w, http.StatusBadRequest, "invalid file path")
+					return
+				}
+				existingParent = parent
+			} else {
+				log.Error().Err(err).Str("path", existingParent).Msg("failed to inspect path")
+				writeError(w, http.StatusInternalServerError, "failed to write file")
+				return
+			}
+		}
+
+		realParent, err := filepath.EvalSymlinks(existingParent)
+		if err != nil {
+			log.Error().Err(err).Str("path", existingParent).Msg("failed to resolve path")
 			writeError(w, http.StatusInternalServerError, "failed to write file")
 			return
 		}
-		if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
-			log.Error().Err(err).Str("path", absPath).Msg("failed to write file")
+		realParent = filepath.Clean(realParent)
+		if !strings.HasPrefix(realParent+pathSeparator, workspacePrefix) {
+			log.Warn().Str("path", relPath).Msg("path traversal blocked")
+			writeError(w, http.StatusBadRequest, "invalid file path")
+			return
+		}
+
+		if err := os.MkdirAll(filepath.Dir(cleanAbs), 0o755); err != nil {
+			log.Error().Err(err).Str("path", cleanAbs).Msg("failed to create directory")
+			writeError(w, http.StatusInternalServerError, "failed to write file")
+			return
+		}
+		if err := os.WriteFile(cleanAbs, []byte(content), 0o644); err != nil {
+			log.Error().Err(err).Str("path", cleanAbs).Msg("failed to write file")
 			writeError(w, http.StatusInternalServerError, "failed to write file")
 			return
 		}
@@ -251,11 +315,15 @@ func diffHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "branch is required")
 		return
 	}
+	if !isSafeGitRefParam(branch) {
+		writeError(w, http.StatusBadRequest, "invalid branch")
+		return
+	}
 
 	log.Info().Str("branch", branch).Msg("generating diff")
 
 	diffRef := fmt.Sprintf("main..%s", branch)
-	out, err := gitExec("diff", diffRef)
+	out, err := gitExec("diff", diffRef, "--")
 	if err != nil {
 		log.Error().Err(err).Str("output", out).Msg("git diff failed")
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("git diff error: %s", out))
@@ -310,6 +378,10 @@ func gitExec(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+func isSafeGitRefParam(value string) bool {
+	return safeGitRefParamPattern.MatchString(value) && !strings.HasPrefix(value, "-")
+}
+
 // ---------------------------------------------------------------------------
 // Redis event publishing
 // ---------------------------------------------------------------------------
@@ -348,6 +420,29 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requireInternalAPIKey(expected string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			provided := r.Header.Get(internalAPIKeyHeader)
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+				writeError(w, http.StatusUnauthorized, "internal service authentication required")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func requestLogger(next http.Handler) http.Handler {

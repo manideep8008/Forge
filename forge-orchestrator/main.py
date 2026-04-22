@@ -5,12 +5,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import structlog
-from fastapi import FastAPI, HTTPException, Header, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 
 from pydantic import BaseModel
 
 from db import get_db, init_pool, close_pool
+from internal_auth import internal_api_headers, require_internal_api_key
 from models.schemas import (
     PipelineCreateRequest,
     PipelineCreateResponse,
@@ -57,26 +57,29 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.middleware("http")(require_internal_api_key)
+
 app.include_router(workspaces)
 app.include_router(comments)
 app.include_router(templates)
 
-_cors_origins = [
-    o.strip()
-    for o in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",")
-    if o.strip()
-]
-
 MAX_PIPELINES_PER_USER = int(os.getenv("MAX_PIPELINES_PER_USER", "10"))
 MAX_LIST_LIMIT = 100
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
 
 
 def _active_tasks_for_user_locked(user_id: str) -> int:
@@ -142,6 +145,96 @@ async def _cancel_tracked_pipeline(pipeline_id: str) -> None:
         task.cancel()
 
 
+def require_user_id(x_user_id: str | None = Header(default=None, alias="X-User-ID")) -> str:
+    """Require the gateway-provided authenticated user id."""
+    if not x_user_id or not x_user_id.strip():
+        raise HTTPException(status_code=401, detail="authentication required")
+    return x_user_id.strip()
+
+
+async def _create_pipeline_record(
+    pipeline_id: str,
+    user_id: str,
+    input_text: str,
+    *,
+    status: PipelineStatus = PipelineStatus.PENDING,
+    parent_pipeline_id: str | None = None,
+    workspace_id: str | None = None,
+    template_id: str | None = None,
+) -> None:
+    pool = await get_db()
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO pipelines (id, user_id, input_text, status, parent_pipeline_id, workspace_id, template_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            pipeline_id, user_id, input_text, status.value,
+            parent_pipeline_id, workspace_id, template_id,
+        )
+
+
+async def _mark_pipeline_running(pipeline_id: str, initial_state: PipelineState) -> None:
+    pool = await get_db()
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO pipelines (id, user_id, input_text, status, parent_pipeline_id)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            pipeline_id, initial_state.user_id, initial_state.input_text,
+            PipelineStatus.RUNNING.value, initial_state.parent_pipeline_id,
+        )
+        await conn.execute(
+            "UPDATE pipelines SET status = $1 WHERE id = $2",
+            PipelineStatus.RUNNING.value, pipeline_id,
+        )
+
+
+async def _delete_pipeline_record(pipeline_id: str) -> None:
+    try:
+        pool = await get_db()
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM pipelines WHERE id = $1", pipeline_id)
+    except Exception as db_err:
+        logger.warning("db_start_cleanup_failed", pipeline_id=pipeline_id, error=str(db_err))
+
+
+async def _mark_pipeline_start_failed(pipeline_id: str, error: Exception) -> None:
+    try:
+        pool = await get_db()
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "UPDATE pipelines SET status = $1, error_message = $2, completed_at = $3 WHERE id = $4",
+                PipelineStatus.FAILED.value, str(error), datetime.now(timezone.utc), pipeline_id,
+            )
+    except Exception as db_err:
+        logger.warning("db_start_failed_update_failed", pipeline_id=pipeline_id, error=str(db_err))
+
+
+async def _cleanup_failed_pipeline_start(pipeline_id: str) -> None:
+    await _release_pipeline_slot(pipeline_id)
+    try:
+        await context_manager.delete(pipeline_id)
+    except Exception as redis_err:
+        logger.warning("redis_start_cleanup_failed", pipeline_id=pipeline_id, error=str(redis_err))
+    await _delete_pipeline_record(pipeline_id)
+
+
+async def _get_owned_pipeline_context(pipeline_id: str, user_id: str) -> dict:
+    """Return pipeline context only when user_id owns it."""
+    ctx = await context_manager.get_all(pipeline_id)
+    if not ctx:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    if ctx.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    return ctx
+
+
 @app.get("/health")
 async def health():
     ollama_ok = await ollama_client.health()
@@ -153,16 +246,14 @@ async def health():
 
 async def _verify_pipeline_owner(pipeline_id: str, user_id: str) -> None:
     """Raise HTTP 403 if user_id does not own the pipeline."""
-    ctx = await context_manager.get_all(pipeline_id)
-    if not ctx:
-        raise HTTPException(status_code=404, detail="Pipeline not found")
-    owner = ctx.get("user_id")
-    if owner and owner != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    await _get_owned_pipeline_context(pipeline_id, user_id)
 
 
 @app.post("/pipeline", response_model=PipelineCreateResponse)
-async def create_pipeline(request: PipelineCreateRequest):
+async def create_pipeline(
+    request: PipelineCreateRequest,
+    user_id: str = Depends(require_user_id),
+):
     """Create and execute a new pipeline."""
     pipeline_id = str(uuid.uuid4())
     correlation_id = str(uuid.uuid4())
@@ -170,29 +261,29 @@ async def create_pipeline(request: PipelineCreateRequest):
     logger.info(
         "pipeline_create",
         pipeline_id=pipeline_id,
-        user_id=request.user_id,
+        user_id=user_id,
         input_length=len(request.input_text),
     )
 
-    await _reserve_pipeline_slot(pipeline_id, request.user_id)
+    await _reserve_pipeline_slot(pipeline_id, user_id)
     try:
+        await _create_pipeline_record(pipeline_id, user_id, request.input_text)
         await context_manager.set_many(pipeline_id, {
             "input_text": request.input_text,
-            "user_id": request.user_id,
+            "user_id": user_id,
             "status": PipelineStatus.PENDING.value,
         })
 
         initial_state = PipelineState(
             pipeline_id=pipeline_id,
-            user_id=request.user_id,
+            user_id=user_id,
             correlation_id=correlation_id,
             input_text=request.input_text,
         )
 
         await _launch_reserved_pipeline(pipeline_id, initial_state)
     except Exception:
-        await _release_pipeline_slot(pipeline_id)
-        await context_manager.delete(pipeline_id)
+        await _cleanup_failed_pipeline_start(pipeline_id)
         raise
 
     return PipelineCreateResponse(
@@ -209,21 +300,8 @@ async def _run_pipeline(pipeline_id: str, initial_state: PipelineState):
         await context_manager.set(pipeline_id, "status", PipelineStatus.RUNNING.value)
         await context_manager.publish_event(pipeline_id, "pipeline.started", {})
 
-        # Insert pipeline row in Postgres
-        try:
-            db = await get_db()
-            await db.execute(
-                """
-                INSERT INTO pipelines (id, user_id, input_text, status, parent_pipeline_id)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                pipeline_id, initial_state.user_id, initial_state.input_text,
-                PipelineStatus.RUNNING.value,
-                initial_state.parent_pipeline_id
-            )
-        except Exception as db_err:
-            logger.warning("db_insert_failed", pipeline_id=pipeline_id, error=str(db_err))
+        # Ensure the Postgres row exists and reflects that execution has started.
+        await _mark_pipeline_running(pipeline_id, initial_state)
 
         result = await pipeline.ainvoke(initial_state.model_dump(mode="python"))
 
@@ -232,21 +310,18 @@ async def _run_pipeline(pipeline_id: str, initial_state: PipelineState):
         await context_manager.set(pipeline_id, "result", result)
 
         # Update pipeline row in Postgres
-        try:
-            db = await get_db()
-            await db.execute(
-                """
-                UPDATE pipelines
-                SET status = $1, intent_type = $2, completed_at = $3
-                WHERE id = $4
-                """,
-                final_status.value,
-                result.get("intent_type"),
-                datetime.now(timezone.utc),
-                pipeline_id,
-            )
-        except Exception as db_err:
-            logger.warning("db_update_failed", pipeline_id=pipeline_id, error=str(db_err))
+        db = await get_db()
+        await db.execute(
+            """
+            UPDATE pipelines
+            SET status = $1, intent_type = $2, completed_at = $3
+            WHERE id = $4
+            """,
+            final_status.value,
+            result.get("intent_type"),
+            datetime.now(timezone.utc),
+            pipeline_id,
+        )
 
         logger.info(
             "pipeline_complete",
@@ -255,6 +330,8 @@ async def _run_pipeline(pipeline_id: str, initial_state: PipelineState):
             total_tokens=result.get("total_tokens", 0),
         )
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error("pipeline_error", pipeline_id=pipeline_id, error=str(e))
         await context_manager.set(pipeline_id, "status", PipelineStatus.FAILED.value)
@@ -270,11 +347,12 @@ async def _run_pipeline(pipeline_id: str, initial_state: PipelineState):
 
 
 @app.get("/pipeline/{pipeline_id}/status")
-async def get_pipeline_status(pipeline_id: str):
+async def get_pipeline_status(
+    pipeline_id: str,
+    user_id: str = Depends(require_user_id),
+):
     """Get pipeline status and stage information."""
-    ctx = await context_manager.get_all(pipeline_id)
-    if not ctx:
-        raise HTTPException(status_code=404, detail="Pipeline not found")
+    ctx = await _get_owned_pipeline_context(pipeline_id, user_id)
 
     result = ctx.get("result", {})
     current_stage = ctx.get("current_stage", None)
@@ -411,25 +489,22 @@ async def get_pipeline_status(pipeline_id: str):
 
 
 @app.get("/pipeline/{pipeline_id}/result")
-async def get_pipeline_result(pipeline_id: str, request: Request):
+async def get_pipeline_result(
+    pipeline_id: str,
+    user_id: str = Depends(require_user_id),
+):
     """Get full pipeline result including all agent outputs."""
-    ctx = await context_manager.get_all(pipeline_id)
-    if not ctx:
-        raise HTTPException(status_code=404, detail="Pipeline not found")
-    user_id = request.headers.get("X-User-ID")
-    if user_id:
-        owner = ctx.get("user_id")
-        if owner and owner != user_id:
-            raise HTTPException(status_code=403, detail="Access denied")
-    return ctx
+    return await _get_owned_pipeline_context(pipeline_id, user_id)
 
 
 @app.post("/pipeline/{pipeline_id}/approve")
-async def approve_pipeline(pipeline_id: str, request: HITLRequest, http_request: Request):
+async def approve_pipeline(
+    pipeline_id: str,
+    request: HITLRequest,
+    user_id: str = Depends(require_user_id),
+):
     """Human-in-the-loop approval endpoint."""
-    user_id = http_request.headers.get("X-User-ID")
-    if user_id:
-        await _verify_pipeline_owner(pipeline_id, user_id)
+    await _verify_pipeline_owner(pipeline_id, user_id)
     await context_manager.set_many(pipeline_id, {
         "hitl_decision": request.decision.value,
         "hitl_comments": request.comments or "",
@@ -442,11 +517,12 @@ async def approve_pipeline(pipeline_id: str, request: HITLRequest, http_request:
 
 
 @app.delete("/pipeline/{pipeline_id}")
-async def delete_pipeline(pipeline_id: str, request: Request):
+async def delete_pipeline(
+    pipeline_id: str,
+    user_id: str = Depends(require_user_id),
+):
     """Delete a pipeline — cancels if running, removes from DB and Redis."""
-    user_id = request.headers.get("X-User-ID")
-    if user_id:
-        await _verify_pipeline_owner(pipeline_id, user_id)
+    await _verify_pipeline_owner(pipeline_id, user_id)
     await _cancel_tracked_pipeline(pipeline_id)
 
     # Clean up Docker containers
@@ -454,7 +530,10 @@ async def delete_pipeline(pipeline_id: str, request: Request):
         import httpx
         docker_svc_url = os.getenv("DOCKER_SVC_URL", "http://forge-docker-svc:8082")
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.delete(f"{docker_svc_url}/docker/cleanup/{pipeline_id}")
+            await client.delete(
+                f"{docker_svc_url}/docker/cleanup/{pipeline_id}",
+                headers=internal_api_headers(),
+            )
     except Exception:
         pass
 
@@ -474,11 +553,12 @@ async def delete_pipeline(pipeline_id: str, request: Request):
 
 
 @app.post("/pipeline/{pipeline_id}/cancel")
-async def cancel_pipeline(pipeline_id: str, request: Request):
+async def cancel_pipeline(
+    pipeline_id: str,
+    user_id: str = Depends(require_user_id),
+):
     """Cancel a running pipeline."""
-    user_id = request.headers.get("X-User-ID")
-    if user_id:
-        await _verify_pipeline_owner(pipeline_id, user_id)
+    await _verify_pipeline_owner(pipeline_id, user_id)
     await _cancel_tracked_pipeline(pipeline_id)
 
     await context_manager.set(pipeline_id, "status", PipelineStatus.CANCELLED.value)
@@ -499,23 +579,19 @@ async def cancel_pipeline(pipeline_id: str, request: Request):
 
 
 @app.post("/pipeline/{pipeline_id}/retry")
-async def retry_pipeline(pipeline_id: str, request: Request):
+async def retry_pipeline(
+    pipeline_id: str,
+    user_id: str = Depends(require_user_id),
+):
     """Retry a failed pipeline from the beginning."""
-    user_id = request.headers.get("X-User-ID")
-    if user_id:
-        await _verify_pipeline_owner(pipeline_id, user_id)
-
-    ctx = await context_manager.get_all(pipeline_id)
-    if not ctx:
-        raise HTTPException(status_code=404, detail="Pipeline not found")
+    ctx = await _get_owned_pipeline_context(pipeline_id, user_id)
 
     input_text = ctx.get("input_text", "")
-    owner_id = ctx.get("user_id", "default-user")
     if not input_text:
         raise HTTPException(status_code=400, detail="No input_text found for pipeline")
 
     await _cancel_tracked_pipeline(pipeline_id)
-    await _reserve_pipeline_slot(pipeline_id, owner_id)
+    await _reserve_pipeline_slot(pipeline_id, user_id)
     try:
         await context_manager.set_many(pipeline_id, {
             "status": PipelineStatus.PENDING.value,
@@ -525,7 +601,7 @@ async def retry_pipeline(pipeline_id: str, request: Request):
 
         initial_state = PipelineState(
             pipeline_id=pipeline_id,
-            user_id=owner_id,
+            user_id=user_id,
             correlation_id=str(uuid.uuid4()),
             input_text=input_text,
         )
@@ -554,7 +630,11 @@ class ModifyPipelineRequest(BaseModel):
 
 
 @app.post("/pipeline/{pipeline_id}/modify")
-async def modify_pipeline(pipeline_id: str, request: ModifyPipelineRequest):
+async def modify_pipeline(
+    pipeline_id: str,
+    request: ModifyPipelineRequest,
+    user_id: str = Depends(require_user_id),
+):
     """Create an iteration pipeline that modifies an existing completed app.
 
     Fetches the generated files from the source pipeline, then runs a new
@@ -565,9 +645,7 @@ async def modify_pipeline(pipeline_id: str, request: ModifyPipelineRequest):
         raise HTTPException(status_code=400, detail="message is required")
 
     # Fetch source pipeline context to get its generated files
-    source_ctx = await context_manager.get_all(pipeline_id)
-    if not source_ctx:
-        raise HTTPException(status_code=404, detail="Source pipeline not found")
+    source_ctx = await _get_owned_pipeline_context(pipeline_id, user_id)
 
     result_data = source_ctx.get("result", {})
     existing_files: dict = {}
@@ -586,7 +664,18 @@ async def modify_pipeline(pipeline_id: str, request: ModifyPipelineRequest):
 
     # Create a new pipeline for this modification run
     new_pipeline_id = str(uuid.uuid4())
-    user_id = source_ctx.get("user_id", "default-user")
+
+    all_file_paths = list(existing_files.keys())
+    files_to_modify = all_file_paths[:10]
+    if len(all_file_paths) > len(files_to_modify):
+        logger.warning(
+            "pipeline_modify_file_plan_truncated",
+            source_pipeline_id=pipeline_id,
+            new_pipeline_id=new_pipeline_id,
+            total_file_count=len(all_file_paths),
+            included_file_count=len(files_to_modify),
+            omitted_file_count=len(all_file_paths) - len(files_to_modify),
+        )
 
     logger.info(
         "pipeline_modify",
@@ -598,6 +687,12 @@ async def modify_pipeline(pipeline_id: str, request: ModifyPipelineRequest):
 
     await _reserve_pipeline_slot(new_pipeline_id, user_id)
     try:
+        await _create_pipeline_record(
+            new_pipeline_id,
+            user_id,
+            request.message,
+            parent_pipeline_id=pipeline_id,
+        )
         await context_manager.set_many(new_pipeline_id, {
             "input_text": request.message,
             "user_id": user_id,
@@ -616,12 +711,11 @@ async def modify_pipeline(pipeline_id: str, request: ModifyPipelineRequest):
             parent_pipeline_id=pipeline_id,
             # Provide a minimal spec so downstream review/test agents still work
             spec={"title": request.message, "description": request.message},
-            file_plan={"files_to_modify": list(existing_files.keys())[:10]},
+            file_plan={"files_to_modify": files_to_modify},
         )
         await _launch_reserved_pipeline(new_pipeline_id, initial_state)
     except Exception:
-        await _release_pipeline_slot(new_pipeline_id)
-        await context_manager.delete(new_pipeline_id)
+        await _cleanup_failed_pipeline_start(new_pipeline_id)
         raise
 
     return {
@@ -633,14 +727,12 @@ async def modify_pipeline(pipeline_id: str, request: ModifyPipelineRequest):
 
 
 @app.post("/pipeline/{pipeline_id}/fork")
-async def fork_pipeline(pipeline_id: str, x_user_id: str | None = Header(None)):
+async def fork_pipeline(
+    pipeline_id: str,
+    user_id: str = Depends(require_user_id),
+):
     """Fork a completed pipeline — starts a fresh pipeline with the same input."""
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="authentication required")
-
-    source_ctx = await context_manager.get_all(pipeline_id)
-    if not source_ctx:
-        raise HTTPException(status_code=404, detail="source pipeline not found")
+    source_ctx = await _get_owned_pipeline_context(pipeline_id, user_id)
 
     input_text = source_ctx.get("input_text", "")
     if not input_text:
@@ -657,18 +749,24 @@ async def fork_pipeline(pipeline_id: str, x_user_id: str | None = Header(None)):
     new_pipeline_id = str(uuid.uuid4())
     logger.info("pipeline_fork", source=pipeline_id, new=new_pipeline_id)
 
-    await _reserve_pipeline_slot(new_pipeline_id, x_user_id)
+    await _reserve_pipeline_slot(new_pipeline_id, user_id)
     try:
+        await _create_pipeline_record(
+            new_pipeline_id,
+            user_id,
+            input_text,
+            parent_pipeline_id=pipeline_id,
+        )
         await context_manager.set_many(new_pipeline_id, {
             "input_text": input_text,
-            "user_id": x_user_id,
+            "user_id": user_id,
             "status": PipelineStatus.PENDING.value,
             "parent_pipeline_id": pipeline_id,
         })
 
         initial_state = PipelineState(
             pipeline_id=new_pipeline_id,
-            user_id=x_user_id,
+            user_id=user_id,
             correlation_id=str(uuid.uuid4()),
             input_text=input_text,
             existing_files=existing_files or {},
@@ -676,18 +774,8 @@ async def fork_pipeline(pipeline_id: str, x_user_id: str | None = Header(None)):
         )
         await _launch_reserved_pipeline(new_pipeline_id, initial_state)
     except Exception:
-        await _release_pipeline_slot(new_pipeline_id)
-        await context_manager.delete(new_pipeline_id)
+        await _cleanup_failed_pipeline_start(new_pipeline_id)
         raise
-
-    try:
-        db = await get_db()
-        await db.execute(
-            "INSERT INTO pipelines (id, user_id, input_text, status, parent_pipeline_id) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
-            new_pipeline_id, x_user_id, input_text, PipelineStatus.RUNNING.value, pipeline_id,
-        )
-    except Exception as db_err:
-        logger.warning("db_fork_insert_failed", pipeline_id=new_pipeline_id, error=str(db_err))
 
     return {
         "pipeline_id": new_pipeline_id,
@@ -703,6 +791,7 @@ async def _create_pipeline_from_schedule(
     input_text: str,
     workspace_id: str | None = None,
     template_id: str | None = None,
+    pipeline_record_exists: bool = False,
 ) -> None:
     """Called by the background scheduler to fire a pipeline from a template."""
     try:
@@ -714,9 +803,19 @@ async def _create_pipeline_from_schedule(
             user_id=user_id,
             error=exc.detail,
         )
+        if pipeline_record_exists:
+            await _mark_pipeline_start_failed(pipeline_id, exc)
         return
 
     try:
+        if not pipeline_record_exists:
+            await _create_pipeline_record(
+                pipeline_id,
+                user_id,
+                input_text,
+                workspace_id=workspace_id,
+                template_id=template_id,
+            )
         await context_manager.set_many(pipeline_id, {
             "input_text": input_text,
             "user_id": user_id,
@@ -731,53 +830,36 @@ async def _create_pipeline_from_schedule(
         await _launch_reserved_pipeline(pipeline_id, initial_state)
     except Exception as exc:
         await _release_pipeline_slot(pipeline_id)
-        await context_manager.delete(pipeline_id)
+        try:
+            await context_manager.delete(pipeline_id)
+        except Exception as redis_err:
+            logger.warning("redis_scheduled_start_cleanup_failed", pipeline_id=pipeline_id, error=str(redis_err))
+        if pipeline_record_exists:
+            await _mark_pipeline_start_failed(pipeline_id, exc)
+        else:
+            await _delete_pipeline_record(pipeline_id)
         logger.error("scheduled_pipeline_start_failed", pipeline_id=pipeline_id, error=str(exc))
         return
-
-    try:
-        db = await get_db()
-        await db.execute(
-            """
-            INSERT INTO pipelines (id, user_id, input_text, status, workspace_id, template_id)
-            VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING
-            """,
-            pipeline_id, user_id, input_text, PipelineStatus.RUNNING.value,
-            workspace_id, template_id,
-        )
-    except Exception:
-        pass
 
 
 @app.get("/pipelines")
 async def list_pipelines(
+    user_id: str = Depends(require_user_id),
     limit: int = Query(default=20, ge=1, le=MAX_LIST_LIMIT),
-    user_id: str | None = None,
 ):
-    """List recent pipelines from PostgreSQL, optionally filtered by user_id."""
+    """List recent pipelines for the authenticated user."""
     try:
         db = await get_db()
-        if user_id:
-            rows = await db.fetch(
-                """
-                SELECT id, user_id, status, intent_type, created_at, completed_at, error_message, parent_pipeline_id, input_text
-                FROM pipelines
-                WHERE user_id = $1
-                ORDER BY created_at DESC
-                LIMIT $2
-                """,
-                user_id, limit,
-            )
-        else:
-            rows = await db.fetch(
-                """
-                SELECT id, user_id, status, intent_type, created_at, completed_at, error_message, parent_pipeline_id, input_text
-                FROM pipelines
-                ORDER BY created_at DESC
-                LIMIT $1
-                """,
-                limit,
-            )
+        rows = await db.fetch(
+            """
+            SELECT id, user_id, status, intent_type, created_at, completed_at, error_message, parent_pipeline_id, input_text
+            FROM pipelines
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            user_id, limit,
+        )
         return {
             "pipelines": [
                 {

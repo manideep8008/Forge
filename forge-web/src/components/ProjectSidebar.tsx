@@ -11,6 +11,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { Pipeline, StageStatus } from '../types';
+import { useAuth } from '../context/AuthContext';
 
 interface ProjectSidebarProps {
   onNewPipeline: () => void;
@@ -32,6 +33,7 @@ function StatusIcon({ status }: { status: StageStatus }) {
 }
 
 export default function ProjectSidebar({ onNewPipeline, refreshKey, onRefresh }: ProjectSidebarProps) {
+  const { authFetch } = useAuth();
   const [pipelines, setPipelines] = useState<Pipeline[]>([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
@@ -43,7 +45,7 @@ export default function ProjectSidebar({ onNewPipeline, refreshKey, onRefresh }:
     const fetchPipelines = async () => {
       try {
         setLoading(true);
-        const res = await fetch('/api/pipelines');
+        const res = await authFetch('/api/pipelines');
         if (res.ok) {
           const data = await res.json();
           setPipelines(Array.isArray(data) ? data : data.pipelines || []);
@@ -55,7 +57,7 @@ export default function ProjectSidebar({ onNewPipeline, refreshKey, onRefresh }:
       }
     };
     fetchPipelines();
-  }, [refreshKey]);
+  }, [refreshKey, authFetch]);
 
   const handleDelete = async (e: React.MouseEvent, pipelineId: string) => {
     e.stopPropagation();
@@ -63,7 +65,7 @@ export default function ProjectSidebar({ onNewPipeline, refreshKey, onRefresh }:
 
     setDeletingId(pipelineId);
     try {
-      const res = await fetch(`/api/pipeline/${pipelineId}`, { method: 'DELETE' });
+      const res = await authFetch(`/api/pipeline/${pipelineId}`, { method: 'DELETE' });
       if (res.ok) {
         setPipelines((prev) => prev.filter((p) => p.id !== pipelineId));
         if (activeId === pipelineId) {
